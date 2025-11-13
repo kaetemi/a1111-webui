@@ -607,6 +607,23 @@ def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_p
             })
 
             piexif.insert(exif_bytes, filename)
+
+    elif extension.lower() == '.tga':
+        # TGA format - use RLE compression for speed
+        if image.mode == 'RGBA':
+            # TGA supports RGBA directly with RLE
+            image.save(filename, format=image_format, compression="tga_rle")
+        elif image.mode in ('RGB', 'L'):
+            # RGB and grayscale also support RLE
+            image.save(filename, format=image_format, compression="tga_rle")
+        else:
+            # Convert other modes to RGB
+            image = image.convert("RGB")
+            image.save(filename, format=image_format, compression="tga_rle")
+        
+        # TGA doesn't support embedded metadata like PNG/EXIF, 
+        # so geninfo will only be saved in separate .txt file if enabled
+
     elif extension.lower() == '.avif':
         if opts.enable_pnginfo and geninfo is not None:
             exif_bytes = piexif.dump({
@@ -660,7 +677,7 @@ def save_image(image, path, basename, seed=None, prompt=None, extension='png', i
     namegen = FilenameGenerator(p, seed, prompt, image, basename=basename)
 
     # WebP and JPG formats have maximum dimension limits of 16383 and 65535 respectively. switch to PNG which has a much higher limit
-    if (image.height > 65535 or image.width > 65535) and extension.lower() in ("jpg", "jpeg") or (image.height > 16383 or image.width > 16383) and extension.lower() == "webp":
+    if (image.height > 65535 or image.width > 65535) and extension.lower() in ("jpg", "jpeg", "tga") or (image.height > 16383 or image.width > 16383) and extension.lower() == "webp":
         print('Image dimensions too large; saving as PNG')
         extension = "png"
 
