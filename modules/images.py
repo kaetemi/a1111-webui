@@ -572,6 +572,8 @@ def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_p
 
     if extension is None:
         extension = os.path.splitext(filename)[1]
+    if extension and not extension.startswith('.'):
+        extension = '.' + extension
 
     image_format = Image.registered_extensions()[extension]
 
