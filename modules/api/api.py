@@ -77,6 +77,40 @@ def verify_url(url):
 
 
 def decode_base64_to_image(encoding):
+    # Handle file:// protocol or direct file paths
+    if encoding.startswith("file://"):
+        # Check if API file access is enabled
+        if not opts.api_input_images_root:
+            raise HTTPException(status_code=403, detail="File path access not enabled. Set api_input_images_root in settings.")
+
+        # Remove file:// prefix
+        file_path = encoding.replace("file://", "")
+
+        # Resolve to absolute path and normalize
+        file_path = os.path.abspath(os.path.normpath(file_path))
+        root_path = os.path.abspath(os.path.normpath(opts.api_input_images_root))
+
+        # Ensure the file is within the allowed root directory
+        if not file_path.startswith(root_path):
+            raise HTTPException(status_code=403, detail="File path outside allowed directory")
+
+        # Check if file exists
+        if not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # Verify it's actually an image file (basic check)
+        allowed_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tga')
+        if not file_path.lower().endswith(allowed_extensions):
+            raise HTTPException(status_code=400, detail="File type not supported")
+
+        try:
+            # Pass the file path directly to images.read
+            image = images.read(file_path)
+            return image
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read image file: {str(e)}") from e
+
+    # HTTP/HTTPS handling
     if encoding.startswith("http://") or encoding.startswith("https://"):
         if not opts.api_enable_requests:
             raise HTTPException(status_code=500, detail="Requests not allowed")
@@ -92,6 +126,7 @@ def decode_base64_to_image(encoding):
         except Exception as e:
             raise HTTPException(status_code=500, detail="Invalid image url") from e
 
+    # base64 handling
     if encoding.startswith("data:image/"):
         encoding = encoding.split(";")[1].split(",")[1]
     try:

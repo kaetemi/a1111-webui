@@ -150,6 +150,7 @@ Warning: writing profile can take a lot of time, up to 30 seconds, and the file 
 options_templates.update(options_section(('API', "API", "system"), {
     "api_enable_requests": OptionInfo(True, "Allow http:// and https:// URLs for input images in API", restrict_api=True),
     "api_forbid_local_requests": OptionInfo(True, "Forbid URLs to local resources", restrict_api=True),
+    "api_input_images_root": OptionInfo("", "Root directory for file path access in API (empty to disable)", restrict_api=True),
     "api_useragent": OptionInfo("", "User agent for requests", restrict_api=True),
 }))
 
