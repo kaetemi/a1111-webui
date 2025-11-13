@@ -606,8 +606,9 @@ class Api:
         reqDict = setUpscalers(req)
 
         reqDict['image'] = decode_base64_to_image(reqDict['image'])
-    
+
         # Extract tmp save options
+        send_images = reqDict.pop('send_images', True)
         save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
         save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
 
@@ -620,15 +621,18 @@ class Api:
             tmp_paths = save_tmp_images([result[0][0]], save_tmp_extension)
             tmp_image_path = tmp_paths[0] if tmp_paths else None
 
-        return models.ExtrasSingleImageResponse(image=encode_pil_to_base64(result[0][0]), tmp_image=tmp_image_path, html_info=result[1])
+        b64image = encode_pil_to_base64(result[0][0]) if send_images else None
+
+        return models.ExtrasSingleImageResponse(image=b64image, tmp_image=tmp_image_path, html_info=result[1])
 
     def extras_batch_images_api(self, req: models.ExtrasBatchImagesRequest):
         reqDict = setUpscalers(req)
 
         image_list = reqDict.pop('imageList', [])
         image_folder = [decode_base64_to_image(x.data) for x in image_list]
-    
+
         # Extract tmp save options
+        send_images = reqDict.pop('send_images', True)
         save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
         save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
 
@@ -640,7 +644,9 @@ class Api:
         if save_tmp_images_flag:
             tmp_image_paths = save_tmp_images(result[0], save_tmp_extension)
 
-        return models.ExtrasBatchImagesResponse(images=list(map(encode_pil_to_base64, result[0])), tmp_images=tmp_image_paths, html_info=result[1])
+        b64images = list(map(encode_pil_to_base64, result[0])) if send_images else []
+
+        return models.ExtrasBatchImagesResponse(images=b64images, tmp_images=tmp_image_paths, html_info=result[1])
 
     def pnginfoapi(self, req: models.PNGInfoRequest):
         image = decode_base64_to_image(req.image.strip())
