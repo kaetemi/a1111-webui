@@ -183,6 +183,9 @@ class PNGInfoResponse(BaseModel):
     items: dict = Field(title="Items", description="A dictionary containing all the other fields the image had")
     parameters: dict = Field(title="Parameters", description="A dictionary with parsed generation info fields")
 
+class ReloadCheckpointRequest(BaseModel):
+    sd_model_checkpoint: Optional[str] = Field(default=None, title="Checkpoint", description="Name of checkpoint to load. If not provided, reloads current checkpoint.")
+
 class ProgressRequest(BaseModel):
     skip_current_image: bool = Field(default=False, title="Skip current image", description="Skip current image serialization")
 

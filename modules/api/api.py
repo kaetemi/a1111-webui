@@ -656,9 +656,18 @@ class Api:
 
         return {}
 
-    def reloadapi(self):
+    def reloadapi(self, req: models.ReloadCheckpointRequest = None):
+        if req and req.sd_model_checkpoint:
+            current_checkpoint_info = sd_models.checkpoint_aliases.get(shared.opts.sd_model_checkpoint)
+            requested_checkpoint_info = sd_models.checkpoint_aliases.get(req.sd_model_checkpoint)
+            if current_checkpoint_info and requested_checkpoint_info:
+                if current_checkpoint_info.hash != requested_checkpoint_info.hash:
+                    # Different checkpoint - use options flow
+                    shared.opts.set("sd_model_checkpoint", req.sd_model_checkpoint, is_api=True)
+                    shared.opts.save(shared.config_filename)
+                    return {}
+        # Same checkpoint (or requested checkpoint not found) - just send current back to device
         sd_models.send_model_to_device(shared.sd_model)
-
         return {}
 
     def skip(self):
