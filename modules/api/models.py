@@ -106,6 +106,8 @@ StableDiffusionTxt2ImgProcessingAPI = PydanticModelGenerator(
         {"key": "script_args", "type": list, "default": []},
         {"key": "send_images", "type": bool, "default": True},
         {"key": "save_images", "type": bool, "default": False},
+        {"key": "save_tmp_images", "type": bool, "default": False},
+        {"key": "save_tmp_extension", "type": str, "default": "png"},
         {"key": "alwayson_scripts", "type": dict, "default": {}},
         {"key": "force_task_id", "type": str, "default": None},
         {"key": "infotext", "type": str, "default": None},
@@ -125,6 +127,8 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
         {"key": "script_args", "type": list, "default": []},
         {"key": "send_images", "type": bool, "default": True},
         {"key": "save_images", "type": bool, "default": False},
+        {"key": "save_tmp_images", "type": bool, "default": False},
+        {"key": "save_tmp_extension", "type": str, "default": "png"},
         {"key": "alwayson_scripts", "type": dict, "default": {}},
         {"key": "force_task_id", "type": str, "default": None},
         {"key": "infotext", "type": str, "default": None},
@@ -133,11 +137,13 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
 
 class TextToImageResponse(BaseModel):
     images: list[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
+    tmp_images: Optional[list[str]] = Field(default=None, title="Temp Image Paths", description="Paths to saved temporary images.")
     parameters: dict
     info: str
 
 class ImageToImageResponse(BaseModel):
     images: list[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
+    tmp_images: Optional[list[str]] = Field(default=None, title="Temp Image Paths", description="Paths to saved temporary images.")
     parameters: dict
     info: str
 
@@ -155,6 +161,8 @@ class ExtrasBaseRequest(BaseModel):
     upscaler_2: str = Field(default="None", title="Secondary upscaler", description=f"The name of the secondary upscaler to use, it has to be one of this list: {' , '.join([x.name for x in sd_upscalers])}")
     extras_upscaler_2_visibility: float = Field(default=0, title="Secondary upscaler visibility", ge=0, le=1, allow_inf_nan=False, description="Sets the visibility of secondary upscaler, values should be between 0 and 1.")
     upscale_first: bool = Field(default=False, title="Upscale first", description="Should the upscaler run before restoring faces?")
+    save_tmp_images: bool = Field(default=False, title="Save Temp Image", description="Save output to tmp folder with random name")
+    save_tmp_extension: str = Field(default="png", title="Temp Image Extension", description="File extension for temp images (e.g. png, jpg, tga)")
 
 class ExtraBaseResponse(BaseModel):
     html_info: str = Field(title="HTML info", description="A series of HTML tags containing the process info.")
@@ -164,6 +172,7 @@ class ExtrasSingleImageRequest(ExtrasBaseRequest):
 
 class ExtrasSingleImageResponse(ExtraBaseResponse):
     image: str = Field(default=None, title="Image", description="The generated image in base64 format.")
+    tmp_image: Optional[str] = Field(default=None, title="Temp Image Path", description="Path to saved temporary image.")
 
 class FileData(BaseModel):
     data: str = Field(title="File data", description="Base64 representation of the file")
@@ -174,6 +183,7 @@ class ExtrasBatchImagesRequest(ExtrasBaseRequest):
 
 class ExtrasBatchImagesResponse(ExtraBaseResponse):
     images: list[str] = Field(title="Images", description="The generated images in base64 format.")
+    tmp_images: Optional[list[str]] = Field(default=None, title="Temp Image Paths", description="Paths to saved temporary images.")
 
 class PNGInfoRequest(BaseModel):
     image: str = Field(title="Image", description="The base64 encoded PNG image")

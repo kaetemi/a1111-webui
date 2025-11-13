@@ -6,6 +6,8 @@ import datetime
 import uvicorn
 import ipaddress
 import requests
+import tempfile
+import uuid
 import gradio as gr
 from threading import Lock
 from io import BytesIO
@@ -131,6 +133,24 @@ def encode_pil_to_base64(image):
 
     return base64.b64encode(bytes_data)
 
+def save_tmp_images(images, extension="png"):
+    """Save images to temp folder with random names and return paths"""
+    tmp_paths = []
+    
+    # Ensure extension starts with a dot
+    if not extension.startswith('.'):
+        extension = '.' + extension
+    
+    for img in images:
+        # Generate random filename
+        random_name = str(uuid.uuid4())
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{random_name}{extension}")
+        
+        # Save image using the existing save function from images module
+        images.save_image_with_geninfo(img, None, tmp_path, extension=extension)
+        tmp_paths.append(tmp_path)
+    
+    return tmp_paths
 
 def api_middleware(app: FastAPI):
     rich_available = False
@@ -457,6 +477,10 @@ class Api:
         args.pop('alwayson_scripts', None)
         args.pop('infotext', None)
 
+        # Extract tmp save options
+        save_tmp_images_flag = args.pop('save_tmp_images', False)
+        save_tmp_extension = args.pop('save_tmp_extension', 'png')
+
         script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts, selectable_script_idx, script_runner, input_script_args=infotext_script_args)
 
         send_images = args.pop('send_images', True)
@@ -487,7 +511,12 @@ class Api:
 
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
 
-        return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+        # Save to tmp if requested
+        tmp_image_paths = None
+        if save_tmp_images_flag:
+            tmp_image_paths = save_tmp_images(processed.images, save_tmp_extension)
+
+        return models.TextToImageResponse(images=b64images, tmp_images=tmp_image_paths, parameters=vars(txt2imgreq), info=processed.js())
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         task_id = img2imgreq.force_task_id or create_task_id("img2img")
@@ -527,6 +556,10 @@ class Api:
         args.pop('alwayson_scripts', None)
         args.pop('infotext', None)
 
+        # Extract tmp save options
+        save_tmp_images_flag = args.pop('save_tmp_images', False)
+        save_tmp_extension = args.pop('save_tmp_extension', 'png')
+
         script_args = self.init_script_args(img2imgreq, self.default_script_arg_img2img, selectable_scripts, selectable_script_idx, script_runner, input_script_args=infotext_script_args)
 
         send_images = args.pop('send_images', True)
@@ -558,32 +591,56 @@ class Api:
 
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
 
+        # Save to tmp if requested
+        tmp_image_paths = None
+        if save_tmp_images_flag:
+            tmp_image_paths = save_tmp_images(processed.images, save_tmp_extension)
+
         if not img2imgreq.include_init_images:
             img2imgreq.init_images = None
             img2imgreq.mask = None
 
-        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+        return models.ImageToImageResponse(images=b64images, tmp_images=tmp_image_paths, parameters=vars(img2imgreq), info=processed.js())
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
 
         reqDict['image'] = decode_base64_to_image(reqDict['image'])
+    
+        # Extract tmp save options
+        save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
+        save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
 
         with self.queue_lock:
             result = postprocessing.run_extras(extras_mode=0, image_folder="", input_dir="", output_dir="", save_output=False, **reqDict)
 
-        return models.ExtrasSingleImageResponse(image=encode_pil_to_base64(result[0][0]), html_info=result[1])
+        # Save to tmp if requested
+        tmp_image_path = None
+        if save_tmp_images_flag:
+            tmp_paths = save_tmp_images([result[0][0]], save_tmp_extension)
+            tmp_image_path = tmp_paths[0] if tmp_paths else None
+
+        return models.ExtrasSingleImageResponse(image=encode_pil_to_base64(result[0][0]), tmp_image=tmp_image_path, html_info=result[1])
 
     def extras_batch_images_api(self, req: models.ExtrasBatchImagesRequest):
         reqDict = setUpscalers(req)
 
         image_list = reqDict.pop('imageList', [])
         image_folder = [decode_base64_to_image(x.data) for x in image_list]
+    
+        # Extract tmp save options
+        save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
+        save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
 
         with self.queue_lock:
             result = postprocessing.run_extras(extras_mode=1, image_folder=image_folder, image="", input_dir="", output_dir="", save_output=False, **reqDict)
 
-        return models.ExtrasBatchImagesResponse(images=list(map(encode_pil_to_base64, result[0])), html_info=result[1])
+        # Save to tmp if requested
+        tmp_image_paths = None
+        if save_tmp_images_flag:
+            tmp_image_paths = save_tmp_images(result[0], save_tmp_extension)
+
+        return models.ExtrasBatchImagesResponse(images=list(map(encode_pil_to_base64, result[0])), tmp_images=tmp_image_paths, html_info=result[1])
 
     def pnginfoapi(self, req: models.PNGInfoRequest):
         image = decode_base64_to_image(req.image.strip())
