@@ -50,6 +50,19 @@ def validate_sampler_name(name):
     return name
 
 
+def validate_prompt_lists(prompt, negative_prompt, batch_size, n_iter):
+    expected = max(1, batch_size or 1) * max(1, n_iter or 1)
+
+    if isinstance(prompt, list) and len(prompt) != expected:
+        raise HTTPException(status_code=400, detail=f"Received {len(prompt)} prompts but batch_size * n_iter = {expected}")
+
+    if isinstance(negative_prompt, list) and len(negative_prompt) != expected:
+        raise HTTPException(status_code=400, detail=f"Received {len(negative_prompt)} negative prompts but batch_size * n_iter = {expected}")
+
+    if isinstance(prompt, list) and isinstance(negative_prompt, list) and len(prompt) != len(negative_prompt):
+        raise HTTPException(status_code=400, detail=f"prompt list ({len(prompt)}) and negative_prompt list ({len(negative_prompt)}) must be the same length")
+
+
 def setUpscalers(req: dict):
     reqDict = vars(req)
     reqDict['extras_upscaler_1'] = reqDict.pop('upscaler_1', None)
@@ -487,6 +500,8 @@ class Api:
     def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
         task_id = txt2imgreq.force_task_id or create_task_id("txt2img")
 
+        validate_prompt_lists(txt2imgreq.prompt, txt2imgreq.negative_prompt, txt2imgreq.batch_size, txt2imgreq.n_iter)
+
         script_runner = scripts.scripts_txt2img
 
         infotext_script_args = {}
@@ -555,6 +570,8 @@ class Api:
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         task_id = img2imgreq.force_task_id or create_task_id("img2img")
+
+        validate_prompt_lists(img2imgreq.prompt, img2imgreq.negative_prompt, img2imgreq.batch_size, img2imgreq.n_iter)
 
         init_images = img2imgreq.init_images
         if init_images is None:

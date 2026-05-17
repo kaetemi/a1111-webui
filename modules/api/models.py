@@ -1,7 +1,7 @@
 import inspect
 
 from pydantic import BaseModel, Field, create_model
-from typing import Any, Optional, Literal
+from typing import Any, Optional, Literal, Union
 from inflection import underscore
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img
 from modules.shared import sd_upscalers, opts, parser
@@ -53,6 +53,10 @@ class PydanticModelGenerator:
             if field_type == 'Image':
                 # images are sent as base64 strings via API
                 field_type = 'str'
+
+            # Per-image prompts: StableDiffusionProcessing.setup_prompts already handles list[str].
+            if k in ('prompt', 'negative_prompt') and field_type is str:
+                return Optional[Union[str, list[str]]]
 
             return Optional[field_type]
 
