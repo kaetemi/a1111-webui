@@ -71,7 +71,8 @@ class Upscaler:
                 break
 
         if img.width != dest_w or img.height != dest_h:
-            img = img.resize((int(dest_w), int(dest_h)), resample=LANCZOS)
+            from modules.upscaler_utils import resize_preserving_float
+            img = resize_preserving_float(img, int(dest_w), int(dest_h), resample=LANCZOS)
 
         return img
 
@@ -125,7 +126,8 @@ class UpscalerLanczos(Upscaler):
     scalers = []
 
     def do_upscale(self, img, selected_model=None):
-        return img.resize((int(img.width * self.scale), int(img.height * self.scale)), resample=LANCZOS)
+        from modules.upscaler_utils import resize_preserving_float
+        return resize_preserving_float(img, int(img.width * self.scale), int(img.height * self.scale), resample=LANCZOS)
 
     def load_model(self, _):
         pass
@@ -140,7 +142,8 @@ class UpscalerNearest(Upscaler):
     scalers = []
 
     def do_upscale(self, img, selected_model=None):
-        return img.resize((int(img.width * self.scale), int(img.height * self.scale)), resample=NEAREST)
+        from modules.upscaler_utils import resize_preserving_float
+        return resize_preserving_float(img, int(img.width * self.scale), int(img.height * self.scale), resample=NEAREST)
 
     def load_model(self, _):
         pass

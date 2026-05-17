@@ -141,6 +141,87 @@ def combine_grid(grid):
     return combined_image
 
 
+def split_grid_float(tensor, tile_w: int = 512, tile_h: int = 512, overlap: int = 64) -> Grid:
+    """Float-tensor counterpart to split_grid.
+
+    Operates on an HWC float tensor and returns a Grid whose tiles are HWC
+    float tensors (views into the input). Used by the SFI-preserving upscaler
+    chain so tiling stays in float space — no PIL crop/quantize per tile.
+    """
+    import torch  # local import to avoid pulling torch on module import
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.as_tensor(tensor)
+    if tensor.ndim != 3:
+        raise ValueError(f"split_grid_float expects HWC tensor, got shape {tuple(tensor.shape)}")
+
+    h, w = tensor.shape[:2]
+    non_overlap_width = tile_w - overlap
+    non_overlap_height = tile_h - overlap
+
+    cols = math.ceil((w - overlap) / non_overlap_width)
+    rows = math.ceil((h - overlap) / non_overlap_height)
+
+    dx = (w - tile_w) / (cols - 1) if cols > 1 else 0
+    dy = (h - tile_h) / (rows - 1) if rows > 1 else 0
+
+    grid = Grid([], tile_w, tile_h, w, h, overlap)
+    for row in range(rows):
+        row_tiles = []
+        y = int(row * dy)
+        if y + tile_h >= h:
+            y = h - tile_h
+        for col in range(cols):
+            x = int(col * dx)
+            if x + tile_w >= w:
+                x = w - tile_w
+            tile = tensor[y:y + tile_h, x:x + tile_w].contiguous()
+            row_tiles.append([x, tile_w, tile])
+        grid.tiles.append([y, tile_h, row_tiles])
+
+    return grid
+
+
+def combine_grid_float(grid: 'Grid'):
+    """Float-tensor counterpart to combine_grid.
+
+    Takes a Grid whose tiles are HWC float tensors and returns a single HWC
+    float tensor. Overlap regions are blended with linear ramps (the same
+    weighting combine_grid does via an L-mode mask, but computed in float so
+    no uint8 quantization happens per paste).
+    """
+    import torch
+    if not grid.tiles or not grid.tiles[0][2]:
+        raise ValueError("combine_grid_float: empty grid")
+
+    sample = grid.tiles[0][2][0][2]
+    channels = sample.shape[-1]
+    dtype = sample.dtype if sample.is_floating_point() else torch.float32
+    out = torch.zeros((grid.image_h, grid.image_w, channels), dtype=dtype)
+
+    overlap = grid.overlap
+    if overlap > 0:
+        ramp = torch.arange(overlap, dtype=dtype) / overlap
+        ramp_w = ramp.reshape(1, overlap, 1)
+        ramp_h = ramp.reshape(overlap, 1, 1)
+
+    for y, h, row in grid.tiles:
+        row_out = torch.zeros((h, grid.image_w, channels), dtype=dtype)
+        for x, w, tile in row:
+            if x == 0:
+                row_out[:, 0:w] = tile
+                continue
+            row_out[:, x:x + overlap] = tile[:, :overlap] * ramp_w + row_out[:, x:x + overlap] * (1 - ramp_w)
+            row_out[:, x + overlap:x + w] = tile[:, overlap:w]
+
+        if y == 0:
+            out[0:h] = row_out
+            continue
+        out[y:y + overlap] = row_out[:overlap] * ramp_h + out[y:y + overlap] * (1 - ramp_h)
+        out[y + overlap:y + h] = row_out[overlap:h]
+
+    return out
+
+
 class GridAnnotation:
     def __init__(self, text='', is_active=True):
         self.text = text
