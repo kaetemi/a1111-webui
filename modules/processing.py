@@ -1031,19 +1031,30 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             for i, x_sample in enumerate(x_samples_ddim):
                 p.batch_index = i
 
+                # Preserve the pre-quantization float [0,1] CHW tensor so the
+                # safetensors save path can write it directly without going
+                # through uint8 (avoids banding, skips PNG encode).
+                sfi_tensor = x_sample.detach().cpu() if hasattr(x_sample, 'detach') else None
+
                 x_sample = 255. * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
                 x_sample = x_sample.astype(np.uint8)
 
                 if p.restore_faces:
                     if save_samples and opts.save_images_before_face_restoration:
-                        images.save_image(Image.fromarray(x_sample), p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-before-face-restoration")
+                        pre_fr_image = Image.fromarray(x_sample)
+                        if sfi_tensor is not None:
+                            pre_fr_image.sfi_tensor = sfi_tensor
+                        images.save_image(pre_fr_image, p.outpath_samples, "", p.seeds[i], p.prompts[i], opts.samples_format, info=infotext(i), p=p, suffix="-before-face-restoration")
 
                     devices.torch_gc()
 
                     x_sample = modules.face_restoration.restore_faces(x_sample)
+                    sfi_tensor = None  # uint8 face restoration invalidated the float
                     devices.torch_gc()
 
                 image = Image.fromarray(x_sample)
+                if sfi_tensor is not None:
+                    image.sfi_tensor = sfi_tensor
 
                 if p.scripts is not None:
                     pp = scripts.PostprocessImageArgs(image)

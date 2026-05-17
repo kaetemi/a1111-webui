@@ -563,6 +563,72 @@ def get_next_sequence_number(path, basename):
     return result + 1
 
 
+class SfiQuantizedSourceError(RuntimeError):
+    """Raised when an SFI write is requested but the float tensor is unavailable.
+
+    The safetensors image format is strict: it writes the unmodified float data
+    produced by the VAE decode, never a uint8 image promoted back to float.
+    This exception fires when something in the pipeline (face restoration, color
+    correction, overlay compositing, upscaler, grid composition, mask derivation,
+    or a script's image mutation) has replaced or modified the original PIL image
+    so that the attached `sfi_tensor` no longer represents the true output.
+    """
+
+
+def _save_sfi_image(image, geninfo, filename, pnginfo_section_name='parameters'):
+    """
+    Write a PIL image as a Safetensors Floating-point Image (SFI) file.
+
+    The PIL image must carry an `sfi_tensor` attribute — a float tensor in [0,1]
+    shaped [H, W, C] or [C, H, W] — produced upstream and not subsequently
+    modified through a uint8 path. If absent, SfiQuantizedSourceError is raised
+    rather than silently promoting uint8 data back to float.
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    tensor = getattr(image, 'sfi_tensor', None)
+    if tensor is None:
+        raise SfiQuantizedSourceError(
+            f"Cannot write {filename!r} as safetensors: no float tensor attached to image. "
+            "The safetensors format requires the unmodified VAE-decode float output. "
+            "Disable any of: face restoration, color correction, overlay/inpaint composite, "
+            "grid save, mask save, upscalers, or image-mutating scripts; or use a different format for these outputs."
+        )
+
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.as_tensor(tensor)
+    tensor = tensor.detach().to(dtype=torch.float32, device='cpu').contiguous()
+
+    if tensor.ndim != 3:
+        raise ValueError(f"sfi_tensor must be 3D (HWC or CHW), got shape {tuple(tensor.shape)}")
+
+    if tensor.shape[0] in (3, 4) and tensor.shape[-1] not in (3, 4):
+        tensor = tensor.permute(1, 2, 0).contiguous()
+
+    channels_count = tensor.shape[-1]
+    if channels_count == 3:
+        channels = 'RGB'
+    elif channels_count == 4:
+        channels = 'RGBA'
+    else:
+        raise ValueError(f"SFI supports 3 or 4 channels, got {channels_count}")
+
+    metadata = {
+        "format": "sfi",
+        "version": "1.0",
+        "primaries": "srgb",
+        "transfer": "srgb",
+        "channels": channels,
+        "dimension_order": "HWC",
+    }
+
+    if opts.enable_pnginfo and geninfo is not None:
+        metadata[pnginfo_section_name] = str(geninfo)
+
+    save_file({"image": tensor}, filename, metadata=metadata)
+
+
 def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_pnginfo=None, pnginfo_section_name='parameters'):
     """
     Saves image to filename, including geninfo as text information for generation info.
@@ -574,6 +640,10 @@ def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_p
         extension = os.path.splitext(filename)[1]
     if extension and not extension.startswith('.'):
         extension = '.' + extension
+
+    if extension.lower() == '.safetensors':
+        _save_sfi_image(image, geninfo, filename, pnginfo_section_name=pnginfo_section_name)
+        return
 
     image_format = Image.registered_extensions()[extension]
 
