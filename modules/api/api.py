@@ -181,23 +181,30 @@ def encode_pil_to_base64(image):
 
     return base64.b64encode(bytes_data)
 
-def save_tmp_images(images, extension="png"):
-    """Save images to temp folder with random names and return paths"""
+def save_tmp_images(image_list, extension="png"):
+    """Save images to temp folder with random names and return paths.
+
+    Parameter was previously named `images`, which shadowed the imported
+    `modules.images` module and made the call below resolve to a list rather
+    than the module — raising `'list' object has no attribute
+    'save_image_with_geninfo'`. Renamed to `image_list` so `images` keeps
+    referring to the module.
+    """
     tmp_paths = []
-    
+
     # Ensure extension starts with a dot
     if not extension.startswith('.'):
         extension = '.' + extension
-    
-    for img in images:
+
+    for img in image_list:
         # Generate random filename
         random_name = str(uuid.uuid4())
         tmp_path = os.path.join(tempfile.gettempdir(), f"{random_name}{extension}")
-        
+
         # Save image using the existing save function from images module
         images.save_image_with_geninfo(img, None, tmp_path, extension=extension)
         tmp_paths.append(tmp_path)
-    
+
     return tmp_paths
 
 def api_middleware(app: FastAPI):

@@ -54,8 +54,14 @@ class PydanticModelGenerator:
                 # images are sent as base64 strings via API
                 field_type = 'str'
 
-            # Per-image prompts: StableDiffusionProcessing.setup_prompts already handles list[str].
-            if k in ('prompt', 'negative_prompt') and field_type is str:
+            # Per-image prompts: StableDiffusionProcessing already handles
+            # list[str] internally (see init() ~L419 and process_images()
+            # ~L866 — both branch on isinstance(self.prompt, list) to fan
+            # out into all_prompts). modules/processing.py uses
+            # `from __future__ import annotations`, so `v.annotation`
+            # here is the *string* 'str', not the str class — the previous
+            # `is str` check never matched. Accept both forms.
+            if k in ('prompt', 'negative_prompt') and field_type in (str, 'str'):
                 return Optional[Union[str, list[str]]]
 
             return Optional[field_type]
