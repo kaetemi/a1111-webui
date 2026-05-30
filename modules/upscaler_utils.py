@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from typing import Callable
 
 import numpy as np
@@ -275,6 +276,16 @@ def resize_preserving_float_gpu_linear(
     else:
         src = sfi.detach().to(dtype=torch.float32)
 
+    # Time just the GPU resample. Sync before t0 so in-flight work from the
+    # preceding upscale isn't charged to us, and before t1 so the elapsed time
+    # reflects completed kernels rather than async launches. Excludes the final
+    # CPU pull below (that's transfer, not resampling).
+    on_cuda = src.device.type == 'cuda'
+    if on_cuda:
+        torch.cuda.synchronize(src.device)
+    t0 = time.perf_counter()
+    print(f"[resize] GPU EWA Lanczos3 {src_w}x{src_h} -> {dest_w}x{dest_h} ({src.device}) start", flush=True)
+
     bchw = src.permute(2, 0, 1).unsqueeze(0).contiguous()
 
     rgb_lin = _srgb_to_linear(bchw[:, :3])
@@ -288,6 +299,10 @@ def resize_preserving_float_gpu_linear(
         rgb_out = torch.cat([rgb_out, rescaled_lin[:, 3:4]], dim=1)
 
     new_sfi = rgb_out.squeeze(0).permute(1, 2, 0).contiguous().detach()
+
+    if on_cuda:
+        torch.cuda.synchronize(src.device)
+    print(f"[resize] GPU EWA Lanczos3 {src_w}x{src_h} -> {dest_w}x{dest_h} done in {(time.perf_counter() - t0) * 1000.0:.0f}ms", flush=True)
 
     arr_u8 = (new_sfi.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
     mode = "RGB" if channels == 3 else "RGBA"
