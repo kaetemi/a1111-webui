@@ -1,3 +1,4 @@
+import math
 import os
 from abc import abstractmethod
 
@@ -58,17 +59,37 @@ class Upscaler:
         dest_h = int((img.height * scale) // 8 * 8)
 
         # A large upscale allocates several full-size float buffers on the GPU
-        # (the model's 4x output, combine/linear copies). If the Stable
-        # Diffusion model is still GPU-resident -- which it now is for
-        # sub-threshold --medvram-sdxl jobs that run fully resident, where the
-        # juggling that used to keep it parked never engages -- the two together
-        # OOM. Park the SD model to CPU first; under lowvram/medvram it pages
-        # back in on the next sampling pass via the forward hooks.
+        # (the model's output, combine/linear copies). If the Stable Diffusion
+        # model is still GPU-resident -- which it now is for sub-threshold
+        # --medvram-sdxl jobs that run fully resident, where the juggling that
+        # used to keep it parked never engages -- the two together OOM. Park the
+        # SD model to CPU first; under lowvram/medvram it pages back in on the
+        # next sampling pass via the forward hooks.
+        #
+        # Gate on the *intermediate* peak, not the requested dest: the model
+        # upscales by its native factor (e.g. 4x) and the result is only then
+        # resized down to the target. A 4x of a ~3k source is a ~12k x 7k
+        # (~84MP) buffer even when the final output is ~12MP, so the requested
+        # dest badly understates the peak.
         from modules import lowvram, sd_models
         sd_model = sd_models.model_data.sd_model  # already-loaded model or None; reading the field does not trigger a load
         if sd_model is not None and lowvram.is_enabled(sd_model):
-            output_mp = (dest_w * dest_h) / 1_000_000
-            if output_mp > shared.cmd_opts.upscale_evict_threshold_mp:
+            native_scale = 4.0
+            for s in getattr(self, 'scalers', []):
+                if s.data_path == selected_model:
+                    native_scale = getattr(s, 'scale', None) or native_scale
+                    break
+
+            # the loop runs ceil(log_native(scale)) native passes (>=1), so the
+            # largest intermediate is native_scale**passes times the source
+            if native_scale > 1.001:
+                passes = max(1, math.ceil(math.log(max(scale, 1.0)) / math.log(native_scale)))
+                peak_factor = native_scale ** passes
+            else:
+                peak_factor = max(scale, 1.0)
+
+            peak_mp = (img.width * peak_factor) * (img.height * peak_factor) / 1_000_000
+            if peak_mp > shared.cmd_opts.upscale_evict_threshold_mp:
                 lowvram.park_all(sd_model)
                 devices.torch_gc()
 

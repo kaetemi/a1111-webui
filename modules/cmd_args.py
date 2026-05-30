@@ -40,7 +40,7 @@ parser.add_argument("--allow-code", action='store_true', help="allow custom scri
 parser.add_argument("--medvram", action='store_true', help="enable stable diffusion model optimizations for sacrificing a little speed for low VRM usage")
 parser.add_argument("--medvram-sdxl", action='store_true', help="enable --medvram optimization just for SDXL models; module juggling is resolution-gated (see --medvram-sdxl-threshold-mp)")
 parser.add_argument("--medvram-sdxl-threshold-mp", type=float, default=1.5, help="resolution in megapixels above which --medvram-sdxl engages module juggling; at or below, the SDXL model runs fully GPU-resident for speed")
-parser.add_argument("--upscale-evict-threshold-mp", type=float, default=20.0, help="under lowvram/medvram, output megapixels above which an upscaler (ESRGAN etc) evicts the resident Stable Diffusion model to CPU first to avoid OOM; the model pages back in on the next sampling pass")
+parser.add_argument("--upscale-evict-threshold-mp", type=float, default=50.0, help="under lowvram/medvram, intermediate upscale-buffer megapixels (the model's native-scale output before downscaling, not the final dest) above which an upscaler (ESRGAN etc) evicts the resident Stable Diffusion model to CPU first to avoid OOM; the model pages back in on the next sampling pass")
 parser.add_argument("--lowvram", action='store_true', help="enable stable diffusion model optimizations for sacrificing a lot of speed for very low VRM usage")
 parser.add_argument("--lowram", action='store_true', help="load stable diffusion checkpoint weights to VRAM instead of RAM")
 parser.add_argument("--always-batch-cond-uncond", action='store_true', help="does not do anything")
