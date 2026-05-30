@@ -635,6 +635,17 @@ def xformers_attnblock_forward(self, x):
 
 
 def sdp_attnblock_forward(self, x):
+    # The VAE AttnBlock is single-head with head_dim == in_channels (512 on the
+    # SDXL VAE). torch's memory-efficient / flash SDPA backends cap head_dim<=256,
+    # so SDPA silently falls back to the math backend, which materializes the full
+    # N×N score matrix (upcast to fp32) and rides the VRAM ceiling — the source of
+    # the intermittent OOM in the img2img VAE encode. When --sub-quad-vae-attention
+    # is set, route exactly that case through sub-quadratic attention (an exact,
+    # pure-torch chunked online-softmax: never forms the N×N matrix, no kernel/arch
+    # dependency). UNet attention goes through CrossAttention, not this function, so
+    # it stays on SDPA. head_dim<=256 attnblocks keep the fast SDPA path.
+    if shared.cmd_opts.sub_quad_vae_attention and self.in_channels > 256:
+        return sub_quad_attnblock_forward(self, x)
     h_ = x
     h_ = self.norm(h_)
     q = self.q(h_)
