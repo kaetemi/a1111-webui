@@ -27,12 +27,19 @@ def initialize():
     devices.device, devices.device_interrogate, devices.device_gfpgan, devices.device_esrgan, devices.device_codeformer = \
         (devices.cpu if any(y in cmd_opts.use_cpu for y in [x, 'all']) else devices.get_optimal_device() for x in ['sd', 'interrogate', 'gfpgan', 'esrgan', 'codeformer'])
 
+    assert not (cmd_opts.bf16_vae and (cmd_opts.no_half or cmd_opts.no_half_vae)), "--bf16-vae conflicts with --no-half and --no-half-vae"
+
     devices.dtype = torch.float32 if cmd_opts.no_half else torch.float16
-    devices.dtype_vae = torch.float32 if cmd_opts.no_half or cmd_opts.no_half_vae else torch.float16
+    if cmd_opts.no_half or cmd_opts.no_half_vae:
+        devices.dtype_vae = torch.float32
+    elif cmd_opts.bf16_vae:
+        devices.dtype_vae = torch.bfloat16
+    else:
+        devices.dtype_vae = torch.float16
     devices.dtype_inference = torch.float32 if cmd_opts.precision == 'full' else devices.dtype
 
     if cmd_opts.precision == "half":
-        msg = "--no-half and --no-half-vae conflict with --precision half"
+        msg = "--no-half, --no-half-vae and --bf16-vae conflict with --precision half"
         assert devices.dtype == torch.float16, msg
         assert devices.dtype_vae == torch.float16, msg
         assert devices.dtype_inference == torch.float16, msg

@@ -462,8 +462,8 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
         vae = model.first_stage_model
         depth_model = getattr(model, 'depth_model', None)
 
-        # with --no-half-vae, remove VAE from model when doing half() to prevent its weights from being converted to float16
-        if shared.cmd_opts.no_half_vae:
+        # with --no-half-vae or --bf16-vae, remove VAE from model when doing half() to prevent its weights from being converted to float16
+        if shared.cmd_opts.no_half_vae or shared.cmd_opts.bf16_vae:
             model.first_stage_model = None
         # with --upcast-sampling, don't convert the depth model weights to float16
         if shared.cmd_opts.upcast_sampling and depth_model:
