@@ -57,6 +57,21 @@ class Upscaler:
         dest_w = int((img.width * scale) // 8 * 8)
         dest_h = int((img.height * scale) // 8 * 8)
 
+        # A large upscale allocates several full-size float buffers on the GPU
+        # (the model's 4x output, combine/linear copies). If the Stable
+        # Diffusion model is still GPU-resident -- which it now is for
+        # sub-threshold --medvram-sdxl jobs that run fully resident, where the
+        # juggling that used to keep it parked never engages -- the two together
+        # OOM. Park the SD model to CPU first; under lowvram/medvram it pages
+        # back in on the next sampling pass via the forward hooks.
+        from modules import lowvram, sd_models
+        sd_model = sd_models.model_data.sd_model  # already-loaded model or None; reading the field does not trigger a load
+        if sd_model is not None and lowvram.is_enabled(sd_model):
+            output_mp = (dest_w * dest_h) / 1_000_000
+            if output_mp > shared.cmd_opts.upscale_evict_threshold_mp:
+                lowvram.park_all(sd_model)
+                devices.torch_gc()
+
         for i in range(3):
             if img.width >= dest_w and img.height >= dest_h and (i > 0 or scale != 1):
                 break
