@@ -1,15 +1,12 @@
 import re
 
 from PIL import Image
-import numpy as np
 
 from modules import scripts_postprocessing, shared
 import gradio as gr
 
 from modules.ui_components import FormRow, ToolButton, InputAccordion
 from modules.ui import switch_values_symbol
-
-upscale_cache = {}
 
 
 def limit_size_by_one_dimention(w, h, limit):
@@ -98,17 +95,7 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
                 upscale_by = max(upscale_to_width/image.width, upscale_to_height/image.height)
                 info["Max side length"] = max_side_length
 
-        cache_key = (hash(np.array(image.getdata()).tobytes()), upscaler.name, upscale_mode, upscale_by,  upscale_to_width, upscale_to_height, upscale_crop)
-        cached_image = upscale_cache.pop(cache_key, None)
-
-        if cached_image is not None:
-            image = cached_image
-        else:
-            image = upscaler.scaler.upscale(image, upscale_by, upscaler.data_path)
-
-        upscale_cache[cache_key] = image
-        if len(upscale_cache) > shared.opts.upscaling_max_images_in_cache:
-            upscale_cache.pop(next(iter(upscale_cache), None), None)
+        image = upscaler.scaler.upscale(image, upscale_by, upscaler.data_path)
 
         if upscale_mode == 1 and upscale_crop:
             cropped = Image.new("RGB", (upscale_to_width, upscale_to_height))
@@ -161,9 +148,6 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
             pp.info["Postprocess upscaler 2"] = upscaler2.name
 
         pp.image = upscaled_image
-
-    def image_changed(self):
-        upscale_cache.clear()
 
 
 class ScriptPostprocessingUpscaleSimple(ScriptPostprocessingUpscale):
