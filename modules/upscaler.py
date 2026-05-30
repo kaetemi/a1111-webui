@@ -71,8 +71,8 @@ class Upscaler:
                 break
 
         if img.width != dest_w or img.height != dest_h:
-            from modules.upscaler_utils import resize_preserving_float
-            img = resize_preserving_float(img, int(dest_w), int(dest_h), resample=LANCZOS)
+            from modules.upscaler_utils import resize_preserving_float_gpu_linear
+            img = resize_preserving_float_gpu_linear(img, int(dest_w), int(dest_h))
 
         return img
 

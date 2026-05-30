@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Callable
 
 import numpy as np
@@ -9,6 +10,134 @@ from PIL import Image
 from modules import devices, images, shared, torch_utils
 
 logger = logging.getLogger(__name__)
+
+
+# sRGB transfer function — high-precision constants from cra-web/COLORSPACES.md /
+# port/src/colorspace_derived.rs. K and T are derived from γ=2.4 and a=0.055 by
+# enforcing C¹ continuity; ICC profiles can't represent K exactly, so use the
+# full-precision values for float math.
+_SRGB_GAMMA = 2.4
+_SRGB_OFFSET = 0.055
+_SRGB_SCALE = 1.055
+_SRGB_LINEAR_SLOPE = 12.923210180787855
+_SRGB_THRESHOLD = 0.0030399346397784314          # linear-side junction
+_SRGB_DECODE_THRESHOLD = 0.039285714285714285    # encoded-side junction (11/280)
+
+
+def _srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
+    # sYCC extended-range, point-symmetric about 0
+    ax = x.abs()
+    linear = x / _SRGB_LINEAR_SLOPE
+    power = torch.sign(x) * ((ax + _SRGB_OFFSET) / _SRGB_SCALE).pow(_SRGB_GAMMA)
+    return torch.where(ax <= _SRGB_DECODE_THRESHOLD, linear, power)
+
+
+def _linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
+    ax = x.abs()
+    linear = x * _SRGB_LINEAR_SLOPE
+    power = torch.sign(x) * (_SRGB_SCALE * ax.pow(1.0 / _SRGB_GAMMA) - _SRGB_OFFSET)
+    return torch.where(ax <= _SRGB_THRESHOLD, linear, power)
+
+
+def _lanczos3_weights_1d(src_len: int, dst_len: int, device: torch.device) -> torch.Tensor:
+    """Dense (dst_len, src_len) Lanczos3 weight matrix matching cra-web's
+    port/src/rescale/{kernels,separable}.rs: independent scaling, adaptive
+    filter scale (max(src/dst, 1)), edge clipping with renormalization.
+    Computed in float64 for exact normalization, returned in float32.
+    """
+    scale = src_len / dst_len
+    filter_scale = max(scale, 1.0)
+
+    dst_pos = torch.arange(dst_len, dtype=torch.float64) + 0.5
+    src_pos = dst_pos * scale - 0.5                 # (dst_len,)
+    si = torch.arange(src_len, dtype=torch.float64)  # (src_len,)
+    d = (src_pos.unsqueeze(1) - si.unsqueeze(0)) / filter_scale  # (dst_len, src_len)
+
+    abs_d = d.abs()
+    pix = math.pi * d
+    # safe sin(πx)/(πx) and sin(πx/3)/(πx/3); the abs<1e-12 path returns 1.0
+    near_zero = abs_d < 1e-12
+    safe_pix = torch.where(near_zero, torch.ones_like(pix), pix)
+    sinc = torch.where(near_zero, torch.ones_like(pix), torch.sin(safe_pix) / safe_pix)
+    safe_pix3 = safe_pix / 3.0
+    win = torch.where(near_zero, torch.ones_like(pix), torch.sin(safe_pix3) / safe_pix3)
+    w = sinc * win
+    # outside the 3-lobe support
+    w = torch.where(abs_d >= 3.0, torch.zeros_like(w), w)
+
+    row_sum = w.sum(dim=1, keepdim=True)
+    nonempty = row_sum.abs() > 1e-12
+    w = torch.where(nonempty, w / row_sum.clamp(min=1e-30), torch.zeros_like(w))
+    return w.to(dtype=torch.float32, device=device)
+
+
+def _resize_2d_lanczos3_linear(
+    bchw: torch.Tensor, dst_h: int, dst_w: int
+) -> torch.Tensor:
+    """Separable Lanczos3 resize for a (B, C, H, W) float tensor.
+
+    Operates on whatever values are in the tensor (does not linearize). Callers
+    are expected to convert to linear RGB beforehand.
+    """
+    _, _, h, w = bchw.shape
+    wh = _lanczos3_weights_1d(w, dst_w, device=bchw.device)  # (dst_w, w)
+    wv = _lanczos3_weights_1d(h, dst_h, device=bchw.device)  # (dst_h, h)
+    # Horizontal: (B, C, H, W) @ (W, dst_w) -> (B, C, H, dst_w)
+    out = bchw @ wh.t()
+    # Vertical: pull H to last axis, multiply by Wv.T, swap back
+    out = out.transpose(-2, -1) @ wv.t()  # (B, C, dst_w, dst_h)
+    return out.transpose(-2, -1).contiguous()
+
+
+def resize_preserving_float_gpu_linear(
+    img: Image.Image, dest_w: int, dest_h: int
+) -> Image.Image:
+    """GPU-accelerated separable Lanczos3 resize performed in linear RGB.
+
+    Matches cra-web's CLI `lanczos3` mode (port/src/rescale, separable path):
+    sRGB → linear (high-precision transfer constants) → Lanczos3 with adaptive
+    radius → linear → sRGB. The float result is reattached as `sfi_tensor` so
+    downstream SFI saves and chained upscales keep float precision.
+
+    Requires the input PIL to carry an `sfi_tensor` attribute (RGB HWC float in
+    sRGB-encoded [0, 1] — i.e. ESRGAN-style model output). Without it we fall
+    back to a plain PIL resize, which is sRGB-space and lossy but the only
+    thing we can honestly do.
+    """
+    sfi = getattr(img, 'sfi_tensor', None)
+    if sfi is None:
+        pil_lanczos = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+        return img.resize((dest_w, dest_h), resample=pil_lanczos)
+
+    if not isinstance(sfi, torch.Tensor):
+        sfi = torch.as_tensor(sfi)
+    if sfi.ndim != 3:
+        raise ValueError(f"sfi_tensor must be HWC 3D, got shape {tuple(sfi.shape)}")
+
+    src_h, src_w, channels = sfi.shape
+    if src_w == dest_w and src_h == dest_h:
+        return img
+
+    device = devices.get_optimal_device()
+    bchw = sfi.detach().to(dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+    rgb_lin = _srgb_to_linear(bchw[:, :3])
+    if channels == 4:
+        rgb_lin = torch.cat([rgb_lin, bchw[:, 3:4]], dim=1)
+
+    rescaled_lin = _resize_2d_lanczos3_linear(rgb_lin, dest_h, dest_w)
+
+    rgb_out = _linear_to_srgb(rescaled_lin[:, :3])
+    if channels == 4:
+        rgb_out = torch.cat([rgb_out, rescaled_lin[:, 3:4]], dim=1)
+
+    new_sfi = rgb_out.squeeze(0).permute(1, 2, 0).contiguous().detach().cpu()
+
+    arr_u8 = (new_sfi.clamp(0, 1).numpy() * 255.0).round().astype(np.uint8)
+    mode = "RGB" if channels == 3 else "RGBA"
+    new_pil = Image.fromarray(arr_u8, mode)
+    new_pil.sfi_tensor = new_sfi
+    return new_pil
 
 
 def pil_image_to_torch_bgr(img: Image.Image) -> torch.Tensor:
