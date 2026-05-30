@@ -874,9 +874,12 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     # a live ~1.5 GiB conditioner into the VAE encode and OOMs by a hair on a
     # 16 GiB card — then strands activations and cascades retries until GC
     # happens to clear it. Mirrors the end-of-loop cleanup below, run up front.
+    devices.log_vram("proc start (pre-cleanup)")
     if lowvram.is_enabled(shared.sd_model):
         lowvram.send_everything_to_cpu()
+    devices.log_vram("proc start (post send_everything_to_cpu)")
     devices.torch_gc()
+    devices.log_vram(f"proc start (post torch_gc) is_img2img={isinstance(p, StableDiffusionProcessingImg2Img)}")
 
     seed = get_fixed_seed(p.seed)
     subseed = get_fixed_seed(p.subseed)
@@ -926,6 +929,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     output_images = []
     with torch.no_grad(), p.sd_model.ema_scope():
         with devices.autocast():
+            devices.log_vram("before p.init")
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
 
             # for OSX, loading the model during sampling changes the generated picture, so it is loaded here

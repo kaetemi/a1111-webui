@@ -92,6 +92,19 @@ def torch_gc():
         npu_specific.torch_npu_gc()
 
 
+def log_vram(label):
+    # TEMPORARY: post-boot OOM hunt. alloc=live tensors, reserved=allocator
+    # cache (what nvidia-smi counts), module_in_gpu=medvram-pinned module.
+    if not torch.cuda.is_available():
+        return
+    from modules import lowvram
+    alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+    reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+    mig = lowvram.module_in_gpu
+    mig_name = type(mig).__name__ if mig is not None else "None"
+    print(f"[VRAM] {label}: alloc={alloc:.0f}MiB reserved={reserved:.0f}MiB module_in_gpu={mig_name}", flush=True)
+
+
 def torch_npu_set_device():
     # Work around due to bug in torch_npu, revert me after fixed, @see https://gitee.com/ascend/pytorch/issues/I8KECW?from=project-issue
     if npu_specific.has_npu:
