@@ -868,6 +868,14 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     else:
         assert p.prompt is not None
 
+    # Evict any medvram-pinned module to CPU before we start. The SDXL
+    # conditioner stays pinned from the load-time warmup (and the upscaler
+    # path never touches medvram), so without this the first img2img carries
+    # a live ~1.5 GiB conditioner into the VAE encode and OOMs by a hair on a
+    # 16 GiB card — then strands activations and cascades retries until GC
+    # happens to clear it. Mirrors the end-of-loop cleanup below, run up front.
+    if lowvram.is_enabled(shared.sd_model):
+        lowvram.send_everything_to_cpu()
     devices.torch_gc()
     devices.log_vram(f"proc start post-gc is_img2img={isinstance(p, StableDiffusionProcessingImg2Img)}")
 
