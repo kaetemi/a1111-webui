@@ -196,16 +196,17 @@ def combine_grid_float(grid: 'Grid'):
     sample = grid.tiles[0][2][0][2]
     channels = sample.shape[-1]
     dtype = sample.dtype if sample.is_floating_point() else torch.float32
-    out = torch.zeros((grid.image_h, grid.image_w, channels), dtype=dtype)
+    device = sample.device
+    out = torch.zeros((grid.image_h, grid.image_w, channels), dtype=dtype, device=device)
 
     overlap = grid.overlap
     if overlap > 0:
-        ramp = torch.arange(overlap, dtype=dtype) / overlap
+        ramp = torch.arange(overlap, dtype=dtype, device=device) / overlap
         ramp_w = ramp.reshape(1, overlap, 1)
         ramp_h = ramp.reshape(overlap, 1, 1)
 
     for y, h, row in grid.tiles:
-        row_out = torch.zeros((h, grid.image_w, channels), dtype=dtype)
+        row_out = torch.zeros((h, grid.image_w, channels), dtype=dtype, device=device)
         for x, w, tile in row:
             if x == 0:
                 row_out[:, 0:w] = tile

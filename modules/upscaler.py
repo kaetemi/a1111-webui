@@ -2,6 +2,7 @@ import os
 from abc import abstractmethod
 
 import PIL
+import torch
 from PIL import Image
 
 import modules.shared
@@ -73,6 +74,14 @@ class Upscaler:
         if img.width != dest_w or img.height != dest_h:
             from modules.upscaler_utils import resize_preserving_float_gpu_linear
             img = resize_preserving_float_gpu_linear(img, int(dest_w), int(dest_h))
+
+        # The upscale chain may have left sfi_tensor on the model device so the
+        # whole loop stays GPU-resident; pull it back to CPU once here so
+        # downstream consumers (SFI save, processing.py, scripts) see the
+        # familiar CPU-resident tensor.
+        sfi = getattr(img, 'sfi_tensor', None)
+        if sfi is not None and isinstance(sfi, torch.Tensor) and sfi.device.type != 'cpu':
+            img.sfi_tensor = sfi.detach().to(device='cpu')
 
         return img
 

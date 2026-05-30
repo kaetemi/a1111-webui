@@ -118,8 +118,15 @@ def resize_preserving_float_gpu_linear(
     if src_w == dest_w and src_h == dest_h:
         return img
 
-    device = devices.get_optimal_device()
-    bchw = sfi.detach().to(dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0).contiguous()
+    # If sfi_tensor is already on a usable accelerator (e.g. came from an
+    # upstream GPU upscale), stay there. Otherwise move to the optimal device.
+    if sfi.device.type == 'cpu':
+        device = devices.get_optimal_device()
+        src = sfi.detach().to(dtype=torch.float32, device=device)
+    else:
+        src = sfi.detach().to(dtype=torch.float32)
+
+    bchw = src.permute(2, 0, 1).unsqueeze(0).contiguous()
 
     rgb_lin = _srgb_to_linear(bchw[:, :3])
     if channels == 4:
@@ -131,9 +138,9 @@ def resize_preserving_float_gpu_linear(
     if channels == 4:
         rgb_out = torch.cat([rgb_out, rescaled_lin[:, 3:4]], dim=1)
 
-    new_sfi = rgb_out.squeeze(0).permute(1, 2, 0).contiguous().detach().cpu()
+    new_sfi = rgb_out.squeeze(0).permute(1, 2, 0).contiguous().detach()
 
-    arr_u8 = (new_sfi.clamp(0, 1).numpy() * 255.0).round().astype(np.uint8)
+    arr_u8 = (new_sfi.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
     mode = "RGB" if channels == 3 else "RGBA"
     new_pil = Image.fromarray(arr_u8, mode)
     new_pil.sfi_tensor = new_sfi
@@ -145,13 +152,15 @@ def pil_image_to_torch_bgr(img: Image.Image) -> torch.Tensor:
 
     If the PIL image carries an `sfi_tensor` attribute (RGB HWC or CHW float
     in [0, 1]), use it directly so the upscaler input chain stays in float —
-    no PIL→uint8→float round-trip.
+    no PIL→uint8→float round-trip. The returned tensor inherits sfi_tensor's
+    device, so a GPU-resident sfi_tensor from a prior upscale iteration stays
+    on the GPU.
     """
     sfi = getattr(img, 'sfi_tensor', None)
     if sfi is not None:
         if not isinstance(sfi, torch.Tensor):
             sfi = torch.as_tensor(sfi)
-        sfi = sfi.detach().to(dtype=torch.float32, device='cpu')
+        sfi = sfi.detach().to(dtype=torch.float32)
         if sfi.ndim != 3:
             raise ValueError(f"sfi_tensor must be 3D, got shape {tuple(sfi.shape)}")
         if sfi.shape[0] in (3, 4) and sfi.shape[-1] not in (3, 4):
@@ -176,7 +185,8 @@ def torch_bgr_to_pil_image(tensor: torch.Tensor) -> Image.Image:
     A float copy of the same data (RGB HWC, clamped to [0, 1]) is attached as
     `sfi_tensor` so the upscaler chain can keep float precision end-to-end
     when a downstream consumer (SFI save, next upscale iteration, float-aware
-    resize) wants it.
+    resize) wants it. The sfi_tensor stays on the source device — only the
+    uint8 view is pulled to CPU.
     """
     if tensor.ndim == 4:
         if tensor.shape[0] != 1:
@@ -184,14 +194,14 @@ def torch_bgr_to_pil_image(tensor: torch.Tensor) -> Image.Image:
         tensor = tensor.squeeze(0)
     assert tensor.ndim == 3, f"{tensor.shape} does not describe a CHW tensor"
 
-    cpu_bgr_chw = tensor.float().detach().cpu().clamp(0, 1)
+    bgr_chw = tensor.float().detach().clamp(0, 1)
 
-    arr = cpu_bgr_chw.numpy()
+    arr = bgr_chw.cpu().numpy()
     arr = 255.0 * np.moveaxis(arr, 0, 2)  # CHW to HWC, rescale
     arr = arr.round().astype(np.uint8)
     arr = arr[:, :, ::-1]  # flip BGR to RGB
     pil = Image.fromarray(arr, "RGB")
-    pil.sfi_tensor = cpu_bgr_chw[[2, 1, 0]].permute(1, 2, 0).contiguous()
+    pil.sfi_tensor = bgr_chw[[2, 1, 0]].permute(1, 2, 0).contiguous()
     return pil
 
 
@@ -239,14 +249,14 @@ def float_bgr_hwc_to_pil(tensor_bgr_hwc: torch.Tensor) -> Image.Image:
 
     Used when the upscaler chain has built the full image in float HWC (via
     combine_grid_float) and we need to hand a PIL back to callers while
-    preserving the float for SFI saves.
+    preserving the float for SFI saves. The sfi_tensor stays on the source
+    device; only the uint8 view is pulled to CPU.
     """
-    cpu_tensor = tensor_bgr_hwc.float().detach().cpu().clamp(0, 1).contiguous()
-    arr = cpu_tensor.numpy()
-    arr_u8 = (arr * 255.0).round().astype(np.uint8)
+    bgr_hwc = tensor_bgr_hwc.float().detach().clamp(0, 1).contiguous()
+    arr_u8 = (bgr_hwc.cpu().numpy() * 255.0).round().astype(np.uint8)
     arr_u8 = arr_u8[:, :, ::-1]  # BGR -> RGB
     pil = Image.fromarray(arr_u8, "RGB")
-    pil.sfi_tensor = cpu_tensor[..., [2, 1, 0]].contiguous()  # BGR HWC -> RGB HWC
+    pil.sfi_tensor = bgr_hwc[..., [2, 1, 0]].contiguous()  # BGR HWC -> RGB HWC
     return pil
 
 
@@ -301,7 +311,7 @@ def upscale_with_model(
                     with devices.without_autocast():
                         out_bchw = model(tile_bchw)
 
-                out_hwc = out_bchw.squeeze(0).float().detach().cpu().clamp(0, 1).permute(1, 2, 0).contiguous()
+                out_hwc = out_bchw.squeeze(0).float().detach().clamp(0, 1).permute(1, 2, 0).contiguous()
                 if scale_factor is None:
                     scale_factor = out_hwc.shape[1] // tile_hwc.shape[1]
                 new_row.append([x * scale_factor, w * scale_factor, out_hwc])
