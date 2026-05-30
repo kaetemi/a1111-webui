@@ -479,6 +479,11 @@ def upscale_with_model(
         overlap=grid.overlap * scale_factor,
     )
     combined_bgr_hwc = images.combine_grid_float(new_grid)
+    # The per-tile GPU outputs and the grid wrappers are no longer needed once
+    # the full image is combined; drop them before building the PIL so they
+    # don't sit on the accelerator alongside the combined buffer (and the
+    # linear-resize copies that follow in Upscaler.upscale).
+    del new_tiles, new_grid, grid
     return float_bgr_hwc_to_pil(combined_bgr_hwc)
 
 

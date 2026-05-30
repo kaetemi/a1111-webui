@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 
 import modules.shared
-from modules import modelloader, shared
+from modules import devices, modelloader, shared
 
 LANCZOS = (Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
 NEAREST = (Image.Resampling.NEAREST if hasattr(Image, 'Resampling') else Image.NEAREST)
@@ -82,6 +82,16 @@ class Upscaler:
         sfi = getattr(img, 'sfi_tensor', None)
         if sfi is not None and isinstance(sfi, torch.Tensor) and sfi.device.type != 'cpu':
             img.sfi_tensor = sfi.detach().to(device='cpu')
+        del sfi  # drop the (possibly GPU-resident) reference before reclaiming
+
+        # The GPU-resident upscale + linear resize allocate several full-size
+        # float tensors on the accelerator (4× model output, combine buffer,
+        # linear/rescaled copies). Now that the only survivor — sfi_tensor — is
+        # back on CPU, return those transient blocks to the OS. Without this the
+        # caching allocator keeps them reserved, fragmenting the arena for the
+        # next model — e.g. an img2img VAE encode that needs a large contiguous
+        # block then OOMs even though enough total memory is free.
+        devices.torch_gc()
 
         return img
 
