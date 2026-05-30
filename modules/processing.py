@@ -869,6 +869,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         assert p.prompt is not None
 
     devices.torch_gc()
+    devices.log_vram(f"proc start post-gc is_img2img={isinstance(p, StableDiffusionProcessingImg2Img)}")
 
     seed = get_fixed_seed(p.seed)
     subseed = get_fixed_seed(p.subseed)
@@ -918,7 +919,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     output_images = []
     with torch.no_grad(), p.sd_model.ema_scope():
         with devices.autocast():
+            devices.log_vram("before p.init (VAE encode for img2img)")
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
+            devices.log_vram("after p.init")
 
             # for OSX, loading the model during sampling changes the generated picture, so it is loaded here
             if shared.opts.live_previews_enable and opts.show_progress_type == "Approx NN":
@@ -1010,6 +1013,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 lowvram.send_everything_to_cpu()
 
             devices.torch_gc()
+            devices.log_vram("proc end post-cleanup")
 
             state.nextjob()
 

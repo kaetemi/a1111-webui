@@ -11,6 +11,12 @@ ModuleWithParent = namedtuple('ModuleWithParent', ['module', 'parent'], defaults
 def send_everything_to_cpu():
     global module_in_gpu
 
+    # TEMPORARY: trace the full-eviction path (the "proper cleanup") so we can
+    # see when it fires relative to the OOM. Remove with the other [VRAM] logs.
+    evicted = type(module_in_gpu).__name__ if module_in_gpu is not None else "None"
+    reserved = torch.cuda.memory_reserved() / (1024 ** 2) if torch.cuda.is_available() else 0
+    print(f"[VRAM] send_everything_to_cpu: evicting={evicted} reserved_before={reserved:.0f}MiB", flush=True)
+
     if module_in_gpu is not None:
         module_in_gpu.to(cpu)
 
@@ -50,6 +56,14 @@ def setup_for_low_vram(sd_model, use_medvram):
 
         if module_in_gpu == module:
             return
+
+        # TEMPORARY: trace each medvram swap (prev module bumped to CPU, new one
+        # pulled to GPU) with the reserved-VRAM watermark. The bumped module's
+        # block stays reserved until an empty_cache, which is the fragmentation
+        # we're chasing. Remove with the other [VRAM] logs.
+        prev = type(module_in_gpu).__name__ if module_in_gpu is not None else "None"
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2) if torch.cuda.is_available() else 0
+        print(f"[VRAM] send_me_to_gpu: {prev} -> {type(module).__name__} reserved={reserved:.0f}MiB", flush=True)
 
         if module_in_gpu is not None:
             module_in_gpu.to(cpu)

@@ -91,7 +91,9 @@ class Upscaler:
         # caching allocator keeps them reserved, fragmenting the arena for the
         # next model — e.g. an img2img VAE encode that needs a large contiguous
         # block then OOMs even though enough total memory is free.
+        devices.log_vram("upscale end pre-gc")
         devices.torch_gc()
+        devices.log_vram("upscale end post-gc")
 
         return img
 
