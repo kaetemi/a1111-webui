@@ -89,15 +89,164 @@ def _resize_2d_lanczos3_linear(
     return out.transpose(-2, -1).contiguous()
 
 
+# Bessel J1 polynomial approximation (Numerical Recipes), matching
+# port/src/rescale/kernels.rs::bessel_j1.
+def _bessel_j1(x: torch.Tensor) -> torch.Tensor:
+    ax = x.abs()
+    y = x * x
+    ans1_lo = x * (72362614232.0 + y * (-7895059235.0 + y * (242396853.1
+        + y * (-2972611.439 + y * (15704.48260 + y * (-30.16036606))))))
+    ans2_lo = 144725228442.0 + y * (2300535178.0 + y * (18583304.74
+        + y * (99447.43394 + y * (376.9991397 + y))))
+    val_lo = ans1_lo / ans2_lo
+    # high branch — clamp ax away from 0 to keep the unused branch finite
+    ax_hi = ax.clamp(min=8.0)
+    z = 8.0 / ax_hi
+    y2 = z * z
+    xx = ax_hi - 2.356194491
+    ans1_hi = 1.0 + y2 * (0.183105e-2 + y2 * (-0.3516396496e-4
+        + y2 * (0.2457520174e-5 + y2 * (-0.240337019e-6))))
+    ans2_hi = 0.04687499995 + y2 * (-0.2002690873e-3
+        + y2 * (0.8449199096e-5 + y2 * (-0.88228987e-6 + y2 * 0.105787412e-6)))
+    val_hi = (0.636619772 / ax_hi).sqrt() * (torch.cos(xx) * ans1_hi - z * torch.sin(xx) * ans2_hi)
+    val_hi = torch.where(x < 0, -val_hi, val_hi)
+    return torch.where(ax < 8.0, val_lo, val_hi)
+
+
+def _jinc(x: torch.Tensor) -> torch.Tensor:
+    """j1(πx)/(πx); 0.5 at x=0 (limit, matches port/src/rescale/kernels.rs::jinc)."""
+    ax = x.abs()
+    near_zero = ax < 1e-8
+    pix = math.pi * x
+    safe = torch.where(near_zero, torch.ones_like(pix), pix)
+    val = _bessel_j1(safe) / safe
+    return torch.where(near_zero, torch.full_like(x, 0.5), val)
+
+
+def _ewa_lanczos3_kernel(r: torch.Tensor) -> torch.Tensor:
+    """jinc(r)·jinc(r/3) for r < 3, with r→0 ⇒ 1.0 (CRA's ewa_lanczos special case)."""
+    val = _jinc(r) * _jinc(r / 3.0)
+    val = torch.where(r < 1e-8, torch.ones_like(r), val)
+    return torch.where(r >= 3.0, torch.zeros_like(r), val)
+
+
+def _resize_2d_ewa_lanczos3_linear(
+    bchw: torch.Tensor, dst_h: int, dst_w: int
+) -> torch.Tensor:
+    """EWA (Elliptical Weighted Average) Lanczos3 resize for (B, C, H, W) tensors.
+
+    Mirrors cra-web's port/src/rescale/ewa.rs with ScaleMode::Independent and
+    TentMode::Off — radial jinc(r)·jinc(r/3) kernel, edge-clipped and
+    renormalized per dst pixel. Operates in whatever value space the tensor is
+    in; caller linearizes RGB before and re-encodes after.
+
+    Processes destination rows in chunks to keep the K×K gather memory bounded.
+    """
+    B, C, H, W = bchw.shape
+    device = bchw.device
+    dtype = bchw.dtype
+
+    scale_x = float(W) / float(dst_w)
+    scale_y = float(H) / float(dst_h)
+    fs_x = max(scale_x, 1.0)
+    fs_y = max(scale_y, 1.0)
+    filter_scale = max(fs_x, fs_y)  # single radial scale; matches ewa.rs
+    base_radius = 3.0
+    radius = base_radius * filter_scale
+    rad_int = int(math.ceil(radius))
+    K = 2 * rad_int + 1
+
+    f32 = torch.float32
+    dy_idx = torch.arange(dst_h, device=device, dtype=f32)
+    dx_idx = torch.arange(dst_w, device=device, dtype=f32)
+    sp_y = (dy_idx + 0.5) * scale_y - 0.5      # (dst_h,)
+    sp_x = (dx_idx + 0.5) * scale_x - 0.5      # (dst_w,)
+    cy = sp_y.floor().long()                    # (dst_h,)
+    cx = sp_x.floor().long()                    # (dst_w,)
+    off = torch.arange(-rad_int, rad_int + 1, device=device)  # (K,)
+
+    src_yi = cy.unsqueeze(1) + off.unsqueeze(0)  # (dst_h, K)
+    src_xi = cx.unsqueeze(1) + off.unsqueeze(0)  # (dst_w, K)
+    valid_y = (src_yi >= 0) & (src_yi < H)
+    valid_x = (src_xi >= 0) & (src_xi < W)
+    sy_c = src_yi.clamp(0, H - 1)                # (dst_h, K)
+    sx_c = src_xi.clamp(0, W - 1)                # (dst_w, K)
+
+    dy_n = (src_yi.to(f32) - sp_y.unsqueeze(1)) / fs_y  # (dst_h, K)
+    dx_n = (src_xi.to(f32) - sp_x.unsqueeze(1)) / fs_x  # (dst_w, K)
+    dy2 = dy_n.pow(2)                                    # (dst_h, K)
+    dx2 = dx_n.pow(2)                                    # (dst_w, K)
+
+    out = torch.empty((B, C, dst_h, dst_w), device=device, dtype=dtype)
+
+    # Chunk so the K×K gather (B,C,chunk,K,dst_w,K) stays under ~256 MB of fp32.
+    bytes_per_elem = 4
+    budget_bytes = 256 * 1024 * 1024
+    per_row = B * C * K * dst_w * K * bytes_per_elem
+    chunk = max(1, min(dst_h, budget_bytes // max(per_row, 1)))
+
+    for y0 in range(0, dst_h, chunk):
+        y1 = min(y0 + chunk, dst_h)
+        nrow = y1 - y0
+
+        sy_slc = sy_c[y0:y1]                  # (nrow, K)
+        vy_slc = valid_y[y0:y1]                # (nrow, K)
+        dy2_slc = dy2[y0:y1]                   # (nrow, K)
+
+        # r²: (nrow, K, dst_w, K)
+        r2 = dy2_slc[:, :, None, None] + dx2[None, None, :, :]
+        r = r2.sqrt()
+        w = _ewa_lanczos3_kernel(r)            # (nrow, K, dst_w, K)
+
+        # Edge mask: drop contributions from out-of-image positions
+        v = vy_slc[:, :, None, None] & valid_x[None, None, :, :]
+        w = torch.where(v, w, torch.zeros_like(w))
+        # Match CRA's "skip if |w| <= 1e-8" gate, which also affects the
+        # weight_sum used for normalization.
+        small = w.abs() <= 1e-8
+        w = torch.where(small, torch.zeros_like(w), w)
+
+        w_sum = w.sum(dim=(1, 3), keepdim=True)  # (nrow, 1, dst_w, 1)
+        ok = w_sum.abs() > 1e-8
+        w_norm = torch.where(ok, w / w_sum.clamp(min=1e-30), torch.zeros_like(w))
+
+        # Gather source pixels
+        # Step 1: pick K source rows per dst row → (B, C, nrow, K, W)
+        y_gathered = bchw[:, :, sy_slc, :]
+        # Step 2: pick K source columns per dst col → (B, C, nrow, K, dst_w, K)
+        full = y_gathered[:, :, :, :, sx_c]
+
+        # Weighted sum over both kernel dims
+        # w_norm: (nrow, K, dst_w, K) → broadcast to (1,1,nrow,K,dst_w,K)
+        chunk_out = (full * w_norm.unsqueeze(0).unsqueeze(0)).sum(dim=(3, 5))
+
+        # Fallback (vanishing weight sum) — nearest-neighbor from src_pos.round()
+        if not bool(ok.all()):
+            ny_fb = sp_y[y0:y1].round().clamp(0, H - 1).long()      # (nrow,)
+            nx_fb = sp_x.round().clamp(0, W - 1).long()              # (dst_w,)
+            fb = bchw[:, :, ny_fb[:, None], nx_fb[None, :]]          # (B, C, nrow, dst_w)
+            ok_2d = ok.squeeze(1).squeeze(2)                          # (nrow, dst_w)
+            chunk_out = torch.where(ok_2d[None, None], chunk_out, fb)
+
+        out[:, :, y0:y1, :] = chunk_out
+
+    return out
+
+
 def resize_preserving_float_gpu_linear(
     img: Image.Image, dest_w: int, dest_h: int
 ) -> Image.Image:
-    """GPU-accelerated separable Lanczos3 resize performed in linear RGB.
+    """GPU-accelerated EWA Lanczos3 resize performed in linear RGB.
 
-    Matches cra-web's CLI `lanczos3` mode (port/src/rescale, separable path):
-    sRGB → linear (high-precision transfer constants) → Lanczos3 with adaptive
-    radius → linear → sRGB. The float result is reattached as `sfi_tensor` so
-    downstream SFI saves and chained upscales keep float precision.
+    Matches cra-web's CLI `ewa-lanczos3` mode (port/src/rescale/ewa.rs):
+    sRGB → linear (high-precision transfer constants) → jinc(r)·jinc(r/3)
+    radial gather with edge clipping/renormalization → linear → sRGB. The
+    float result is reattached as `sfi_tensor` so downstream SFI saves and
+    chained upscales keep float precision.
+
+    EWA is non-separable — for diagonal edges and non-uniform downscales it
+    avoids the axis-aligned bias of separable Lanczos3. Validated bit-exact
+    against `cra ... --scale-method ewa-lanczos3 --no-colorspace-aware-output`.
 
     Requires the input PIL to carry an `sfi_tensor` attribute (RGB HWC float in
     sRGB-encoded [0, 1] — i.e. ESRGAN-style model output). Without it we fall
@@ -132,7 +281,7 @@ def resize_preserving_float_gpu_linear(
     if channels == 4:
         rgb_lin = torch.cat([rgb_lin, bchw[:, 3:4]], dim=1)
 
-    rescaled_lin = _resize_2d_lanczos3_linear(rgb_lin, dest_h, dest_w)
+    rescaled_lin = _resize_2d_ewa_lanczos3_linear(rgb_lin, dest_h, dest_w)
 
     rgb_out = _linear_to_srgb(rescaled_lin[:, :3])
     if channels == 4:
