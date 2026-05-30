@@ -6,6 +6,12 @@ from modules import devices, shared
 module_in_gpu = None
 cpu = torch.device("cpu")
 
+# Whether the medvram/lowvram module juggling is currently engaged. When False
+# the hooks load each module to the GPU on demand and leave it resident, which
+# is the full-speed, non-medvram behavior. --medvram-sdxl toggles this per job
+# based on resolution (see should_juggle); plain --medvram/--lowvram keep it on.
+juggle_active = True
+
 ModuleWithParent = namedtuple('ModuleWithParent', ['module', 'parent'], defaults=['None'])
 
 def send_everything_to_cpu():
@@ -15,6 +21,35 @@ def send_everything_to_cpu():
         module_in_gpu.to(cpu)
 
     module_in_gpu = None
+
+
+def park_all(sd_model):
+    """Push every medvram-pinned big module to CPU and reset the tracker. Unlike
+    send_everything_to_cpu (which only evicts the single tracked module), this
+    also clears modules left resident by a preceding non-juggling (low-res) job,
+    giving the swap a clean slate before a high-res job starts."""
+    global module_in_gpu
+
+    for module in getattr(sd_model, '_medvram_modules', []):
+        module.to(cpu)
+
+    module_in_gpu = None
+
+
+def should_juggle(sd_model, width, height):
+    """Whether module juggling should be engaged for a job at this resolution.
+    Plain --lowvram/--medvram always juggle; --medvram-sdxl is gated on the
+    target megapixels so the common low-res case runs fully resident for speed."""
+    if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
+        return True
+
+    threshold = shared.cmd_opts.medvram_sdxl_threshold_mp * 1_000_000
+    return (width * height) > threshold
+
+
+def set_juggle(active):
+    global juggle_active
+    juggle_active = active
 
 
 def is_needed(sd_model):
@@ -47,6 +82,11 @@ def setup_for_low_vram(sd_model, use_medvram):
         global module_in_gpu
 
         module = parents.get(module, module)
+
+        if not juggle_active:
+            # full-resident mode: page this module in and leave it there
+            module.to(devices.device)
+            return
 
         if module_in_gpu == module:
             return
@@ -105,6 +145,10 @@ def setup_for_low_vram(sd_model, use_medvram):
     # put modules back. the modules will be in CPU.
     for (obj, field), module in zip(to_remain_in_cpu, stored):
         setattr(obj, field, module)
+
+    # remember the big modules so park_all can evict any left resident by a
+    # non-juggling (low-res) job; their submodules ride along via .to(cpu)
+    sd_model._medvram_modules = [module for module in stored if module is not None]
 
     # register hooks for those the first three models
     if hasattr(sd_model, "cond_stage_model") and hasattr(sd_model.cond_stage_model, "medvram_modules"):

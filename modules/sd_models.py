@@ -728,7 +728,10 @@ def get_empty_cond(sd_model):
 def send_model_to_cpu(m):
     if m is not None:
         if m.lowvram:
-            lowvram.send_everything_to_cpu()
+            # park_all (not send_everything_to_cpu) so modules left resident by a
+            # non-juggling low-res job are evicted too, rather than leaking across
+            # a checkpoint switch
+            lowvram.park_all(m)
         else:
             m.to(devices.cpu)
 

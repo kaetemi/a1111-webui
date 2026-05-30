@@ -883,14 +883,22 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     else:
         assert p.prompt is not None
 
-    # Evict any medvram-pinned module to CPU before we start. The SDXL
-    # conditioner stays pinned from the load-time warmup (and the upscaler
-    # path never touches medvram), so without this the first img2img carries
-    # a live ~1.5 GiB conditioner into the VAE encode and OOMs by a hair on a
-    # 16 GiB card — then strands activations and cascades retries until GC
-    # happens to clear it. Mirrors the end-of-loop cleanup below, run up front.
+    # Decide whether to juggle modules this job. --medvram-sdxl only engages
+    # the swap above its megapixel threshold; below it the SDXL model runs fully
+    # resident for speed. Plain --medvram/--lowvram always juggle.
+    #
+    # When juggling, park every pinned module to CPU before we start. The SDXL
+    # conditioner stays pinned from the load-time warmup (and the upscaler path
+    # never touches medvram), so without this the first img2img carries a live
+    # ~1.5 GiB conditioner into the VAE encode and OOMs by a hair on a 16 GiB
+    # card — then strands activations and cascades retries until GC happens to
+    # clear it. park_all also clears anything left resident by a preceding
+    # low-res job. Mirrors the end-of-loop cleanup below, run up front.
     if lowvram.is_enabled(shared.sd_model):
-        lowvram.send_everything_to_cpu()
+        juggle = lowvram.should_juggle(shared.sd_model, p.width, p.height)
+        lowvram.set_juggle(juggle)
+        if juggle:
+            lowvram.park_all(shared.sd_model)
     devices.torch_gc()
 
     seed = get_fixed_seed(p.seed)
@@ -1029,7 +1037,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             del samples_ddim
 
-            if lowvram.is_enabled(shared.sd_model):
+            if lowvram.is_enabled(shared.sd_model) and lowvram.juggle_active:
                 lowvram.send_everything_to_cpu()
 
             devices.torch_gc()
