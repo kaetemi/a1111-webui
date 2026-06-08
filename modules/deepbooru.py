@@ -94,5 +94,36 @@ class DeepDanbooru:
 
         return ", ".join(res)
 
+    def tag_probabilities(self, pil_image, threshold=None, include_ratings=False):
+        """Return {tag: probability} of raw sigmoid scores (0..1) for every tag
+        scoring at or above `threshold` (defaults to the configured
+        interrogate_deepbooru_score_threshold; pass 0 to get every tag). rating:*
+        tags are included only when include_ratings is True. No display
+        formatting (spaces / escape / alpha-sort / filter-tags) is applied — the
+        caller gets the raw scores to do with as they like."""
+        self.start()
+        try:
+            if threshold is None:
+                threshold = shared.opts.interrogate_deepbooru_score_threshold
+
+            pic = images.resize_image(2, pil_image.convert("RGB"), 512, 512)
+            a = np.expand_dims(np.array(pic, dtype=np.float32), 0) / 255
+
+            with torch.no_grad(), devices.autocast():
+                x = torch.from_numpy(a).to(devices.device, devices.dtype)
+                y = self.model(x)[0].detach().cpu().numpy()
+
+            result = {}
+            for tag, probability in zip(self.model.tags, y):
+                if probability < threshold:
+                    continue
+                if tag.startswith("rating:") and not include_ratings:
+                    continue
+                result[tag] = float(probability)
+
+            return result
+        finally:
+            self.stop()
+
 
 model = DeepDanbooru()

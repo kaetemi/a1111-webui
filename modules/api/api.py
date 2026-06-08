@@ -762,6 +762,15 @@ class Api:
             if interrogatereq.model == "clip":
                 processed = shared.interrogator.interrogate(img)
             elif interrogatereq.model == "deepdanbooru":
+                if interrogatereq.probabilities:
+                    tags = deepbooru.model.tag_probabilities(
+                        img,
+                        threshold=interrogatereq.threshold,
+                        include_ratings=interrogatereq.include_ratings,
+                    )
+                    # caption is a convenience view: tag names, highest score first.
+                    caption = ", ".join(t for t, _ in sorted(tags.items(), key=lambda kv: -kv[1]))
+                    return models.InterrogateResponse(caption=caption, tags=tags)
                 processed = deepbooru.model.tag(img)
             else:
                 raise HTTPException(status_code=404, detail="Model not found")

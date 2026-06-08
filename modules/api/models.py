@@ -1,7 +1,7 @@
 import inspect
 
 from pydantic import BaseModel, Field, create_model
-from typing import Any, Optional, Literal, Union
+from typing import Any, Dict, Optional, Literal, Union
 from inflection import underscore
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img
 from modules.shared import sd_upscalers, opts, parser
@@ -220,9 +220,13 @@ class ProgressResponse(BaseModel):
 class InterrogateRequest(BaseModel):
     image: str = Field(default="", title="Image", description="Image to work on, must be a Base64 string containing the image's data.")
     model: str = Field(default="clip", title="Model", description="The interrogate model used.")
+    probabilities: bool = Field(default=False, title="Probabilities", description="deepdanbooru only: also return the per-tag probability scores (0..1) in the 'tags' field.")
+    threshold: Optional[float] = Field(default=None, title="Threshold", description="deepdanbooru only: minimum score for a tag to be returned. Defaults to the configured interrogate_deepbooru_score_threshold; pass 0 to return every tag.")
+    include_ratings: bool = Field(default=False, title="Include ratings", description="deepdanbooru only: include rating:* tags (safe/questionable/explicit) in the probabilities.")
 
 class InterrogateResponse(BaseModel):
     caption: str = Field(default=None, title="Caption", description="The generated caption for the image.")
+    tags: Optional[Dict[str, float]] = Field(default=None, title="Tags", description="deepdanbooru only, when probabilities is requested: { tag: probability } with raw scores in 0..1.")
 
 class TrainResponse(BaseModel):
     info: str = Field(title="Train info", description="Response string from train embedding or hypernetwork task.")
