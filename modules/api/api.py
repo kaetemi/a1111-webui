@@ -23,7 +23,7 @@ from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
 
 import modules.shared as shared
-from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items, script_callbacks, infotext_utils, sd_models, sd_schedulers
+from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items, script_callbacks, infotext_utils, sd_models, sd_schedulers, lowvram
 from modules.api import models
 from modules.shared import opts
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
@@ -309,6 +309,29 @@ def save_tmp_latents(latent_list, vae_encode_method=None):
             f.write(serialize_latent_to_bytes(latent, vae_encode_method))
         tmp_paths.append(tmp_path)
     return tmp_paths
+
+
+def medvram_park_for_job(width, height):
+    """Apply the same medvram-sdxl resolution gate + eviction that
+    process_images_inner runs before a job. The standalone VAE endpoints don't go
+    through process_images, so without this they inherit the previous job's sticky
+    juggle_active state and never park the pinned modules — stranding e.g. the
+    load-time SDXL conditioner into the VAE pass and OOMing by a hair. Must be
+    called under queue_lock (it mutates the lowvram.juggle_active global)."""
+    if lowvram.is_enabled(shared.sd_model):
+        juggle = lowvram.should_juggle(shared.sd_model, width, height)
+        lowvram.set_juggle(juggle)
+        if juggle:
+            lowvram.park_all(shared.sd_model)
+    devices.torch_gc()
+
+
+def medvram_evict_after_job():
+    """Mirror process_images_inner's end-of-loop eviction: push everything back to
+    CPU when juggling, so a resident model doesn't leak past the VAE op."""
+    if lowvram.is_enabled(shared.sd_model) and lowvram.juggle_active:
+        lowvram.send_everything_to_cpu()
+    devices.torch_gc()
 
 
 def api_middleware(app: FastAPI):
@@ -632,10 +655,11 @@ class Api:
         approx = approximation_indexes.get(method, 0)
 
         with self.queue_lock:
+            medvram_park_for_job(pil.width, pil.height)
             image = image.to(shared.device, dtype=devices.dtype_vae)
             latent = images_tensor_to_samples(image, approx, shared.sd_model)
-
-        latent = latent.detach().to(devices.cpu, dtype=torch.float32)
+            latent = latent.detach().to(devices.cpu, dtype=torch.float32)
+            medvram_evict_after_job()
 
         b64latent = encode_latent_to_base64(latent, method) if req.send_latent else None
         tmp_latent = save_tmp_latents([latent], method)[0] if req.save_tmp_latent else None
@@ -648,14 +672,21 @@ class Api:
         method = req.vae_decode_method or opts.sd_vae_decode_method
         approx = approximation_indexes.get(method, 0)
 
+        # Pixel dims the decode will produce (latent is downscaled by 8), used for
+        # the medvram resolution gate just like p.width/p.height in img2img.
+        decode_height = latent.shape[2] * 8
+        decode_width = latent.shape[3] * 8
+
         pil_images = []
         with self.queue_lock:
+            medvram_park_for_job(decode_width, decode_height)
             latent = latent.to(shared.device, dtype=devices.dtype_vae)
             for i in range(latent.shape[0]):
                 x_sample = samples_to_images_tensor(latent[i:i + 1], approx, shared.sd_model)[0]
                 x_sample = torch.clamp((x_sample.to(torch.float32) + 1.0) / 2.0, min=0.0, max=1.0)
                 x_sample = 255.0 * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
                 pil_images.append(Image.fromarray(x_sample.astype(np.uint8)))
+            medvram_evict_after_job()
 
         b64images = list(map(encode_pil_to_base64, pil_images)) if req.send_images else []
         tmp_image_paths = save_tmp_images(pil_images, req.save_tmp_extension) if req.save_tmp_images else None
