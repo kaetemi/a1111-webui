@@ -515,8 +515,12 @@ class StableDiffusionProcessing:
 
 
 class Processed:
-    def __init__(self, p: StableDiffusionProcessing, images_list, seed=-1, info="", subseed=None, all_prompts=None, all_negative_prompts=None, all_seeds=None, all_subseeds=None, index_of_first_image=0, infotexts=None, comments=""):
+    def __init__(self, p: StableDiffusionProcessing, images_list, seed=-1, info="", subseed=None, all_prompts=None, all_negative_prompts=None, all_seeds=None, all_subseeds=None, index_of_first_image=0, infotexts=None, comments="", latents=None):
         self.images = images_list
+        # Per-image final latents (cpu float32, one [1,C,H,W] tensor each), captured
+        # only when p.return_latents is set. None when latents were not requested or
+        # are unavailable (e.g. hires latent-upscale already decoded to pixels).
+        self.latents = latents
         self.prompt = p.prompt
         self.negative_prompt = p.negative_prompt
         self.seed = seed
@@ -947,6 +951,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     infotexts = []
     output_images = []
+    output_latents = [] if getattr(p, 'return_latents', False) else None
     with torch.no_grad(), p.sd_model.ema_scope():
         with devices.autocast():
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
@@ -1027,6 +1032,10 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 x_samples_ddim = samples_ddim
             else:
                 devices.test_for_nans(samples_ddim, "unet")
+
+                if output_latents is not None:
+                    for li in range(samples_ddim.shape[0]):
+                        output_latents.append(samples_ddim[li:li + 1].detach().to(devices.cpu, dtype=torch.float32))
 
                 if opts.sd_vae_decode_method != 'Full':
                     p.extra_generation_params['VAE Decoder'] = opts.sd_vae_decode_method
@@ -1184,6 +1193,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         subseed=p.all_subseeds[0],
         index_of_first_image=index_of_first_image,
         infotexts=infotexts,
+        latents=output_latents,
     )
 
     if p.scripts is not None:
@@ -1624,6 +1634,9 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
     init_img_hash: str = field(default=None, init=False)
     mask_for_overlay: Image = field(default=None, init=False)
     init_latent: torch.Tensor = field(default=None, init=False)
+    # When set, this latent is fed directly as init_latent and the VAE encode of
+    # init_images is skipped entirely (the API's latent-input path).
+    init_latent_override: torch.Tensor = field(default=None, init=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1653,6 +1666,34 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
         crop_region = None
 
         image_mask = self.image_mask
+
+        if self.init_latent_override is not None:
+            # Latent-input path: feed the supplied latent directly and skip the VAE
+            # encode of init_images. Masks/inpainting are rejected (handled upstream)
+            # because they need the decoded source image for overlays/conditioning.
+            if image_mask is not None:
+                raise ValueError("Latent input (init_latents) cannot be combined with a mask or inpainting.")
+
+            # Special model families derive conditioning from the source image itself;
+            # a bare latent can't drive them, so fail loudly rather than silently wrong.
+            if (isinstance(self.sd_model, LatentDepth2ImageDiffusion)
+                    or self.sd_model.cond_stage_key == "edit"
+                    or self.sampler.conditioning_key in {'hybrid', 'concat'}
+                    or self.sampler.conditioning_key == "crossattn-adm"
+                    or self.sampler.model_wrap.inner_model.is_sdxl_inpaint):
+                raise ValueError("Latent input is not supported for depth/edit/unclip/inpainting models.")
+
+            self.init_latent = self.init_latent_override.to(shared.device, dtype=devices.dtype)
+            self.init_latent_override = None
+
+            if opts.img2img_color_correction:
+                model_hijack.comments.append("Color correction is disabled for latent input (no source image).")
+
+            # Standard models return dummy zero conditioning derived from the latent shape;
+            # the placeholder source image is never read on that path.
+            placeholder = self.init_latent.new_zeros((self.init_latent.shape[0], 3, 8, 8))
+            self.image_conditioning = self.img2img_image_conditioning(placeholder, self.init_latent)
+            return
 
         if image_mask is not None:
             # image_mask is passed in as RGBA by Gradio to support alpha masks,

@@ -118,6 +118,8 @@ StableDiffusionTxt2ImgProcessingAPI = PydanticModelGenerator(
         {"key": "save_images", "type": bool, "default": False},
         {"key": "save_tmp_images", "type": bool, "default": False},
         {"key": "save_tmp_extension", "type": str, "default": "png"},
+        {"key": "send_latent", "type": bool, "default": False},
+        {"key": "save_tmp_latent", "type": bool, "default": False},
         {"key": "alwayson_scripts", "type": dict, "default": {}},
         {"key": "force_task_id", "type": str, "default": None},
         {"key": "infotext", "type": str, "default": None},
@@ -130,6 +132,7 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
     [
         {"key": "sampler_index", "type": str, "default": "Euler"},
         {"key": "init_images", "type": list, "default": None},
+        {"key": "init_latents", "type": list, "default": None},
         {"key": "denoising_strength", "type": float, "default": 0.75},
         {"key": "mask", "type": str, "default": None},
         {"key": "include_init_images", "type": bool, "default": False, "exclude" : True},
@@ -139,6 +142,8 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
         {"key": "save_images", "type": bool, "default": False},
         {"key": "save_tmp_images", "type": bool, "default": False},
         {"key": "save_tmp_extension", "type": str, "default": "png"},
+        {"key": "send_latent", "type": bool, "default": False},
+        {"key": "save_tmp_latent", "type": bool, "default": False},
         {"key": "alwayson_scripts", "type": dict, "default": {}},
         {"key": "force_task_id", "type": str, "default": None},
         {"key": "infotext", "type": str, "default": None},
@@ -148,14 +153,41 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
 class TextToImageResponse(BaseModel):
     images: list[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
     tmp_images: Optional[list[str]] = Field(default=None, title="Temp Image Paths", description="Paths to saved temporary images.")
+    latents: Optional[list[str]] = Field(default=None, title="Latents", description="Per-image final latents as base64 safetensors blobs (when send_latent is set).")
+    tmp_latents: Optional[list[str]] = Field(default=None, title="Temp Latent Paths", description="Paths to saved temporary latent safetensors files (when save_tmp_latent is set).")
     parameters: dict
     info: str
 
 class ImageToImageResponse(BaseModel):
     images: list[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
     tmp_images: Optional[list[str]] = Field(default=None, title="Temp Image Paths", description="Paths to saved temporary images.")
+    latents: Optional[list[str]] = Field(default=None, title="Latents", description="Per-image final latents as base64 safetensors blobs (when send_latent is set).")
+    tmp_latents: Optional[list[str]] = Field(default=None, title="Temp Latent Paths", description="Paths to saved temporary latent safetensors files (when save_tmp_latent is set).")
     parameters: dict
     info: str
+
+class VAEEncodeRequest(BaseModel):
+    image: str = Field(title="Image", description="Image to encode: base64 data, a file:// path under api_input_images_root, or an http(s) URL.")
+    vae_encode_method: Optional[str] = Field(default=None, title="VAE Encode Method", description="Override the VAE encode method (Full, Approx NN, Approx cheap, TAESD). Defaults to the sd_vae_encode_method setting.")
+    send_latent: bool = Field(default=True, title="Send latent", description="Return the latent as a base64 safetensors blob.")
+    save_tmp_latent: bool = Field(default=False, title="Save Temp Latent", description="Save the latent to the tmp folder as a .safetensors file with a random name.")
+
+class VAEEncodeResponse(BaseModel):
+    latent: Optional[str] = Field(default=None, title="Latent", description="The encoded latent as a base64 safetensors blob.")
+    tmp_latent: Optional[str] = Field(default=None, title="Temp Latent Path", description="Path to the saved temporary latent file.")
+    shape: list[int] = Field(title="Shape", description="Shape of the encoded latent tensor [B, C, H, W].")
+    vae_encode_method: str = Field(title="VAE Encode Method", description="The VAE encode method that was used.")
+
+class VAEDecodeRequest(BaseModel):
+    latent: str = Field(title="Latent", description="Latent to decode: base64 safetensors blob or a file:// path under api_input_images_root.")
+    vae_decode_method: Optional[str] = Field(default=None, title="VAE Decode Method", description="Override the VAE decode method (Full, Approx NN, Approx cheap, TAESD). Defaults to the sd_vae_decode_method setting.")
+    send_images: bool = Field(default=True, title="Send images", description="Return the decoded image(s) in base64 format.")
+    save_tmp_images: bool = Field(default=False, title="Save Temp Image", description="Save the decoded image(s) to the tmp folder with random names.")
+    save_tmp_extension: str = Field(default="png", title="Temp Image Extension", description="File extension for temp images (e.g. png, jpg, tga).")
+
+class VAEDecodeResponse(BaseModel):
+    images: list[str] = Field(default=None, title="Images", description="The decoded image(s) in base64 format.")
+    tmp_images: Optional[list[str]] = Field(default=None, title="Temp Image Paths", description="Paths to saved temporary images.")
 
 class ExtrasBaseRequest(BaseModel):
     resize_mode: Literal[0, 1] = Field(default=0, title="Resize Mode", description="Sets the resize mode: 0 to upscale by upscaling_resize amount, 1 to upscale up to upscaling_resize_h x upscaling_resize_w.")

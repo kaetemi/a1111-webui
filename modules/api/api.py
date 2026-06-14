@@ -8,6 +8,10 @@ import ipaddress
 import requests
 import tempfile
 import uuid
+import json
+import numpy as np
+import torch
+import safetensors.torch
 import gradio as gr
 from threading import Lock
 from io import BytesIO
@@ -23,9 +27,10 @@ from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, post
 from modules.api import models
 from modules.shared import opts
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
+from modules.sd_samplers_common import images_tensor_to_samples, samples_to_images_tensor, approximation_indexes
 from modules.textual_inversion.textual_inversion import create_embedding, train_embedding
 from modules.hypernetworks.hypernetwork import create_hypernetwork, train_hypernetwork
-from PIL import PngImagePlugin
+from PIL import Image, PngImagePlugin
 from modules.sd_models_config import find_checkpoint_config_near_filename
 from modules.realesrgan_model import get_realesrgan_models
 from modules import devices
@@ -207,6 +212,105 @@ def save_tmp_images(image_list, extension="png"):
 
     return tmp_paths
 
+
+# Latents are exchanged as safetensors blobs carrying an internal filetype marker in
+# the file metadata, so a load can reject anything that isn't one of ours.
+LATENT_FILETYPE = "sd-webui-latent"
+LATENT_FORMAT_VERSION = "1"
+
+
+def read_safetensors_metadata(data):
+    """Return the safetensors __metadata__ dict from a raw safetensors byte string."""
+    if len(data) < 8:
+        raise HTTPException(status_code=400, detail="Not a valid latent file")
+    header_len = int.from_bytes(data[:8], "little")
+    try:
+        header = json.loads(data[8:8 + header_len])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Not a valid latent file") from e
+    return header.get("__metadata__", {}) or {}
+
+
+def serialize_latent_to_bytes(latent, vae_encode_method=None):
+    """Pack a single latent tensor into a safetensors blob with our filetype marker."""
+    latent = latent.detach().to(devices.cpu).contiguous()
+    metadata = {
+        "filetype": LATENT_FILETYPE,
+        "version": LATENT_FORMAT_VERSION,
+        "shape": json.dumps(list(latent.shape)),
+        "dtype": str(latent.dtype).replace("torch.", ""),
+    }
+    if vae_encode_method:
+        metadata["vae_encode_method"] = vae_encode_method
+    model_hash = getattr(shared.sd_model, "sd_model_hash", None)
+    if model_hash:
+        metadata["sd_model_hash"] = model_hash
+    return safetensors.torch.save({"latent": latent}, metadata=metadata)
+
+
+def encode_latent_to_base64(latent, vae_encode_method=None):
+    return base64.b64encode(serialize_latent_to_bytes(latent, vae_encode_method)).decode("ascii")
+
+
+def deserialize_latent_from_bytes(data):
+    metadata = read_safetensors_metadata(data)
+    if metadata.get("filetype") != LATENT_FILETYPE:
+        raise HTTPException(status_code=400, detail="File is not a sd-webui latent (missing filetype marker)")
+    try:
+        tensors = safetensors.torch.load(data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Failed to parse latent data") from e
+    latent = tensors.get("latent")
+    if latent is None:
+        raise HTTPException(status_code=400, detail="Latent file has no 'latent' tensor")
+    if latent.dim() == 3:
+        latent = latent.unsqueeze(0)
+    if latent.dim() != 4:
+        raise HTTPException(status_code=400, detail="Latent must be a 3D or 4D tensor")
+    return latent
+
+
+def decode_base64_to_latent(encoding):
+    # file:// path, sandboxed to the same root as image input, .safetensors only
+    if encoding.startswith("file://"):
+        if not opts.api_input_images_root:
+            raise HTTPException(status_code=403, detail="File path access not enabled. Set api_input_images_root in settings.")
+
+        file_path = encoding.replace("file://", "")
+        file_path = os.path.abspath(os.path.normpath(file_path))
+        root_path = os.path.abspath(os.path.normpath(opts.api_input_images_root))
+
+        if not file_path.startswith(root_path):
+            raise HTTPException(status_code=403, detail="File path outside allowed directory")
+        if not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        if not file_path.lower().endswith(".safetensors"):
+            raise HTTPException(status_code=400, detail="Latent file must be .safetensors")
+
+        with open(file_path, "rb") as f:
+            data = f.read()
+        return deserialize_latent_from_bytes(data)
+
+    # base64 blob
+    try:
+        data = base64.b64decode(encoding)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Invalid encoded latent") from e
+    return deserialize_latent_from_bytes(data)
+
+
+def save_tmp_latents(latent_list, vae_encode_method=None):
+    """Save latents to the temp folder as .safetensors with random names; return paths."""
+    tmp_paths = []
+    for latent in latent_list:
+        random_name = str(uuid.uuid4())
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{random_name}.safetensors")
+        with open(tmp_path, "wb") as f:
+            f.write(serialize_latent_to_bytes(latent, vae_encode_method))
+        tmp_paths.append(tmp_path)
+    return tmp_paths
+
+
 def api_middleware(app: FastAPI):
     rich_available = False
     try:
@@ -285,6 +389,8 @@ class Api:
         api_middleware(self.app)
         self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
         self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
+        self.add_api_route("/sdapi/v1/vae/encode", self.vae_encode_api, methods=["POST"], response_model=models.VAEEncodeResponse)
+        self.add_api_route("/sdapi/v1/vae/decode", self.vae_decode_api, methods=["POST"], response_model=models.VAEDecodeResponse)
         self.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=models.ExtrasSingleImageResponse)
         self.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=models.ExtrasBatchImagesResponse)
         self.add_api_route("/sdapi/v1/png-info", self.pnginfoapi, methods=["POST"], response_model=models.PNGInfoResponse)
@@ -504,6 +610,58 @@ class Api:
 
         return params
 
+    def collect_output_latents(self, processed, send_latent_flag, save_tmp_latent_flag):
+        """Serialize the per-image final latents captured during generation, if any.
+
+        processed.latents is None when latents weren't requested or are unavailable
+        (e.g. hires latent-upscale, where the final sample is already decoded)."""
+        if not (send_latent_flag or save_tmp_latent_flag) or not processed.latents:
+            return None, None
+
+        latents_b64 = [encode_latent_to_base64(latent) for latent in processed.latents] if send_latent_flag else None
+        tmp_latent_paths = save_tmp_latents(processed.latents) if save_tmp_latent_flag else None
+        return latents_b64, tmp_latent_paths
+
+    def vae_encode_api(self, req: models.VAEEncodeRequest):
+        pil = decode_base64_to_image(req.image).convert("RGB")
+        arr = np.array(pil).astype(np.float32) / 255.0
+        arr = np.moveaxis(arr, 2, 0)
+        image = torch.from_numpy(np.expand_dims(arr, axis=0))
+
+        method = req.vae_encode_method or opts.sd_vae_encode_method
+        approx = approximation_indexes.get(method, 0)
+
+        with self.queue_lock:
+            image = image.to(shared.device, dtype=devices.dtype_vae)
+            latent = images_tensor_to_samples(image, approx, shared.sd_model)
+
+        latent = latent.detach().to(devices.cpu, dtype=torch.float32)
+
+        b64latent = encode_latent_to_base64(latent, method) if req.send_latent else None
+        tmp_latent = save_tmp_latents([latent], method)[0] if req.save_tmp_latent else None
+
+        return models.VAEEncodeResponse(latent=b64latent, tmp_latent=tmp_latent, shape=list(latent.shape), vae_encode_method=method)
+
+    def vae_decode_api(self, req: models.VAEDecodeRequest):
+        latent = decode_base64_to_latent(req.latent)
+
+        method = req.vae_decode_method or opts.sd_vae_decode_method
+        approx = approximation_indexes.get(method, 0)
+
+        pil_images = []
+        with self.queue_lock:
+            latent = latent.to(shared.device, dtype=devices.dtype_vae)
+            for i in range(latent.shape[0]):
+                x_sample = samples_to_images_tensor(latent[i:i + 1], approx, shared.sd_model)[0]
+                x_sample = torch.clamp((x_sample.to(torch.float32) + 1.0) / 2.0, min=0.0, max=1.0)
+                x_sample = 255.0 * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
+                pil_images.append(Image.fromarray(x_sample.astype(np.uint8)))
+
+        b64images = list(map(encode_pil_to_base64, pil_images)) if req.send_images else []
+        tmp_image_paths = save_tmp_images(pil_images, req.save_tmp_extension) if req.save_tmp_images else None
+
+        return models.VAEDecodeResponse(images=b64images, tmp_images=tmp_image_paths)
+
     def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
         task_id = txt2imgreq.force_task_id or create_task_id("txt2img")
 
@@ -537,6 +695,8 @@ class Api:
         # Extract tmp save options
         save_tmp_images_flag = args.pop('save_tmp_images', False)
         save_tmp_extension = args.pop('save_tmp_extension', 'png')
+        send_latent_flag = args.pop('send_latent', False)
+        save_tmp_latent_flag = args.pop('save_tmp_latent', False)
 
         script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts, selectable_script_idx, script_runner, input_script_args=infotext_script_args)
 
@@ -551,6 +711,7 @@ class Api:
                 p.scripts = script_runner
                 p.outpath_grids = opts.outdir_txt2img_grids
                 p.outpath_samples = opts.outdir_txt2img_samples
+                p.return_latents = send_latent_flag or save_tmp_latent_flag
 
                 try:
                     shared.state.begin(job="scripts_txt2img")
@@ -573,7 +734,9 @@ class Api:
         if save_tmp_images_flag:
             tmp_image_paths = save_tmp_images(processed.images, save_tmp_extension)
 
-        return models.TextToImageResponse(images=b64images, tmp_images=tmp_image_paths, parameters=vars(txt2imgreq), info=processed.js())
+        latents_b64, tmp_latent_paths = self.collect_output_latents(processed, send_latent_flag, save_tmp_latent_flag)
+
+        return models.TextToImageResponse(images=b64images, tmp_images=tmp_image_paths, latents=latents_b64, tmp_latents=tmp_latent_paths, parameters=vars(txt2imgreq), info=processed.js())
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         task_id = img2imgreq.force_task_id or create_task_id("img2img")
@@ -581,12 +744,16 @@ class Api:
         validate_prompt_lists(img2imgreq.prompt, img2imgreq.negative_prompt, img2imgreq.batch_size, img2imgreq.n_iter)
 
         init_images = img2imgreq.init_images
-        if init_images is None:
-            raise HTTPException(status_code=404, detail="Init image not found")
+        init_latents = img2imgreq.init_latents
+        if init_images is None and not init_latents:
+            raise HTTPException(status_code=404, detail="Init image or latent not found")
 
         mask = img2imgreq.mask
         if mask:
             mask = decode_base64_to_image(mask)
+
+        if init_latents and mask:
+            raise HTTPException(status_code=400, detail="Latent input (init_latents) cannot be combined with a mask")
 
         script_runner = scripts.scripts_img2img
 
@@ -610,6 +777,7 @@ class Api:
 
         args = vars(populate)
         args.pop('include_init_images', None)  # this is meant to be done by "exclude": True in model, but it's for a reason that I cannot determine.
+        args.pop('init_latents', None)  # fed directly as init_latent_override below, not a processing kwarg
         args.pop('script_name', None)
         args.pop('script_args', None)  # will refeed them to the pipeline directly after initializing them
         args.pop('alwayson_scripts', None)
@@ -618,6 +786,8 @@ class Api:
         # Extract tmp save options
         save_tmp_images_flag = args.pop('save_tmp_images', False)
         save_tmp_extension = args.pop('save_tmp_extension', 'png')
+        send_latent_flag = args.pop('send_latent', False)
+        save_tmp_latent_flag = args.pop('save_tmp_latent', False)
 
         script_args = self.init_script_args(img2imgreq, self.default_script_arg_img2img, selectable_scripts, selectable_script_idx, script_runner, input_script_args=infotext_script_args)
 
@@ -628,11 +798,15 @@ class Api:
 
         with self.queue_lock:
             with closing(StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)) as p:
-                p.init_images = [decode_base64_to_image(x) for x in init_images]
+                if init_images is not None:
+                    p.init_images = [decode_base64_to_image(x) for x in init_images]
+                if init_latents:
+                    p.init_latent_override = torch.cat([decode_base64_to_latent(x) for x in init_latents], dim=0)
                 p.is_api = True
                 p.scripts = script_runner
                 p.outpath_grids = opts.outdir_img2img_grids
                 p.outpath_samples = opts.outdir_img2img_samples
+                p.return_latents = send_latent_flag or save_tmp_latent_flag
 
                 try:
                     shared.state.begin(job="scripts_img2img")
@@ -655,11 +829,14 @@ class Api:
         if save_tmp_images_flag:
             tmp_image_paths = save_tmp_images(processed.images, save_tmp_extension)
 
+        latents_b64, tmp_latent_paths = self.collect_output_latents(processed, send_latent_flag, save_tmp_latent_flag)
+
         if not img2imgreq.include_init_images:
             img2imgreq.init_images = None
             img2imgreq.mask = None
+            img2imgreq.init_latents = None
 
-        return models.ImageToImageResponse(images=b64images, tmp_images=tmp_image_paths, parameters=vars(img2imgreq), info=processed.js())
+        return models.ImageToImageResponse(images=b64images, tmp_images=tmp_image_paths, latents=latents_b64, tmp_latents=tmp_latent_paths, parameters=vars(img2imgreq), info=processed.js())
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
