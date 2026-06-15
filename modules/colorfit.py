@@ -241,6 +241,28 @@ class ColorFitModel:
             m_raw = tensors[f"M{i}.M_raw"].to(device, dtype=torch.float32)
             self.matrices.append(_normalize_matrix(m_raw))
 
+        # Sanity-check the computed buffers. NaN/inf at this stage means
+        # something went wrong reconstructing the model (corrupt safetensors
+        # file, extreme theta values, etc.) and the apply path would either
+        # NaN-cascade into the output safetensors (cra dither collapses) or
+        # produce out-of-bounds indices when seg = NaN.floor().long() (async
+        # CUDA device-side assert). Fail fast at load time with a clear
+        # message instead.
+        def _finite(t, name):
+            if not torch.isfinite(t).all():
+                raise ValueError(
+                    f"ColorFit model {path}: {name} contains NaN or inf "
+                    f"after reconstruction. The file is corrupt or has "
+                    f"extreme parameter values."
+                )
+        for i, ky in enumerate(self.knot_ys, start=1):
+            _finite(ky, f"f{i} knot_y")
+        for i, sl in enumerate(self.slopes, start=1):
+            if sl is not None:
+                _finite(sl, f"f{i} slopes")
+        for i, m in enumerate(self.matrices, start=1):
+            _finite(m, f"M{i} normalized")
+
     # Curve apply, fully vectorized across channel & pixel. x: (N, 3).
     def _apply_curve(self, x: torch.Tensor, knot_y: torch.Tensor,
                      slopes: Optional[torch.Tensor]) -> torch.Tensor:
@@ -294,6 +316,26 @@ class ColorFitModel:
             )
         B, _, H, W = rgb_bchw.shape
         x = rgb_bchw.permute(0, 2, 3, 1).reshape(-1, 3).contiguous()  # (N, 3)
+        # Defensive: NaN/inf in the upstream sRGB float (e.g. from a
+        # numerical edge case in the EWA Lanczos resize or
+        # _linear_to_srgb) would propagate to .long() index conversion in
+        # _apply_curve and produce out-of-bounds indices → asynchronous
+        # CUDA device-side assert that surfaces in a later torch_gc().
+        # AND finite values outside [0, 1] are equally lethal: composed
+        # cubic Hermite extrapolation off the leftmost/rightmost segment
+        # amplifies the overshoot exponentially across stages and overflows
+        # float32 to NaN within a handful of curves. The calibration was
+        # trained exclusively on sRGB inputs in [0, 1]; anything outside is
+        # undefined and downstream by design.
+        #
+        # The EWA Lanczos pass upstream produces values slightly outside
+        # [0, 1] because Lanczos has negative kernel lobes that, in linear
+        # space, produce small negatives at high-contrast edges. The
+        # subsequent _linear_to_srgb amplifies a -0.02 linear into a
+        # -0.30 sRGB via the steep K≈12.92 slope of the linear segment.
+        # The clamp here is mandatory, not optional — see FIT_FORMAT.md
+        # "Input clamp" for the full rationale and observed numbers.
+        x = x.nan_to_num(nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         x = self._apply_curve(x, self.knot_ys[0], self.slopes[0])
         for i in range(self.n_matrices):
             M = self.matrices[i].to(dtype=x.dtype)
