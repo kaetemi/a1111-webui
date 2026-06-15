@@ -879,8 +879,21 @@ class Api:
         save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
         save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
 
-        with self.queue_lock:
-            result = postprocessing.run_extras(extras_mode=0, image_folder="", input_dir="", output_dir="", save_output=False, **reqDict)
+        # Skip the post-upscale float→u8 PIL regen when nothing wants u8:
+        # the response won't carry base64 (send_images=False) AND any tmp
+        # save will route through the safetensors writer (which reads
+        # sfi_tensor, not PIL pixel data). Cuts the float CPU pull at the
+        # resize step, which on a 1.5x valar output is ~36 MB / ~2 ms but
+        # adds up across long upscale chains and large outputs.
+        skip_u8 = (not send_images) and (str(save_tmp_extension).lower() == 'safetensors')
+        from modules.upscaler_utils import set_post_upscale_skip_u8
+
+        try:
+            set_post_upscale_skip_u8(skip_u8)
+            with self.queue_lock:
+                result = postprocessing.run_extras(extras_mode=0, image_folder="", input_dir="", output_dir="", save_output=False, **reqDict)
+        finally:
+            set_post_upscale_skip_u8(False)
 
         # Save to tmp if requested
         tmp_image_path = None
@@ -903,8 +916,16 @@ class Api:
         save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
         save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
 
-        with self.queue_lock:
-            result = postprocessing.run_extras(extras_mode=1, image_folder=image_folder, image="", input_dir="", output_dir="", save_output=False, **reqDict)
+        # See extras_single_image_api — same skip condition.
+        skip_u8 = (not send_images) and (str(save_tmp_extension).lower() == 'safetensors')
+        from modules.upscaler_utils import set_post_upscale_skip_u8
+
+        try:
+            set_post_upscale_skip_u8(skip_u8)
+            with self.queue_lock:
+                result = postprocessing.run_extras(extras_mode=1, image_folder=image_folder, image="", input_dir="", output_dir="", save_output=False, **reqDict)
+        finally:
+            set_post_upscale_skip_u8(False)
 
         # Save to tmp if requested
         tmp_image_paths = None

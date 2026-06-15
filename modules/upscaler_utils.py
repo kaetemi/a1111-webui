@@ -1,7 +1,8 @@
 import logging
 import math
 import time
-from typing import Callable
+import threading
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -11,6 +12,44 @@ from PIL import Image
 from modules import devices, images, shared, torch_utils
 
 logger = logging.getLogger(__name__)
+
+
+# Per-thread flag: when True, resize_preserving_float_gpu_linear skips its
+# final float→u8 PIL regen entirely. The returned PIL is a 1x1 stub with
+# the nominal `.size` patched in and `sfi_tensor` attached. Safe ONLY when
+# the caller has committed to the safetensors save path AND won't access
+# PIL pixel data (no .save() of PNG/JPEG/WebP, no .tobytes(), no base64).
+#
+# The extras API handler sets this when send_images=False AND
+# save_tmp_extension is .safetensors — the cra-fed worker flow where the
+# u8 PIL data is dead weight (cra dithers from the float sfi_tensor and
+# writes the final PNG itself). A1111 single-threads through queue_lock,
+# so the flag is effectively process-wide during a request, but
+# threading.local keeps it safe if that ever changes.
+_post_upscale_u8_state = threading.local()
+
+
+def set_post_upscale_skip_u8(skip: bool) -> None:
+    """Toggle the post-upscale u8 regen skip flag for the current thread."""
+    _post_upscale_u8_state.skip = bool(skip)
+
+
+def _should_skip_post_upscale_u8() -> bool:
+    return getattr(_post_upscale_u8_state, "skip", False)
+
+
+def _make_sfi_only_pil(mode: str, size: tuple, sfi_tensor: torch.Tensor) -> Image.Image:
+    """Build a PIL Image with the nominal `size` and `mode` reported but NO
+    real u8 pixel buffer at that size. Internally allocates a 1×1 PIL and
+    patches `_size`, then attaches `sfi_tensor`. Anything that reads `.size`,
+    `.width`, `.height`, `.mode`, or `.sfi_tensor` sees correct values;
+    anything that touches the underlying pixel core (`.im`, `.save()` to
+    PNG/JPEG/WebP, `.tobytes()`, base64 encoding) sees a 1×1 zero image.
+    Caller must guarantee no such access happens."""
+    stub = Image.new(mode, (1, 1))
+    stub._size = (int(size[0]), int(size[1]))
+    stub.sfi_tensor = sfi_tensor
+    return stub
 
 
 # sRGB transfer function — high-precision constants from cra-web/COLORSPACES.md /
@@ -235,7 +274,8 @@ def _resize_2d_ewa_lanczos3_linear(
 
 
 def resize_preserving_float_gpu_linear(
-    img: Image.Image, dest_w: int, dest_h: int
+    img: Image.Image, dest_w: int, dest_h: int,
+    colorfit_model: Optional[str] = None,
 ) -> Image.Image:
     """GPU-accelerated EWA Lanczos3 resize performed in linear RGB.
 
@@ -253,6 +293,16 @@ def resize_preserving_float_gpu_linear(
     sRGB-encoded [0, 1] — i.e. ESRGAN-style model output). Without it we fall
     back to a plain PIL resize, which is sRGB-space and lossy but the only
     thing we can honestly do.
+
+    When `colorfit_model` is set, the named ColorFit transform
+    (modules/colorfit.py — structured_sandwich_v{1,2,3,4} fit from
+    pv_hina/upscale_calibration) is applied per-pixel on GPU AFTER the
+    linear→sRGB conversion. Fused into this same GPU pass so we keep one
+    CPU pull (the final u8 regen) and operate on the smaller post-resize
+    tensor — matches the calibration resolution and avoids the
+    upscaled-resolution VRAM hit. When the resize is a no-op (dims already
+    match) but `colorfit_model` is set, the EWA Lanczos pass is skipped
+    and only the colorfit + u8 regen run.
     """
     sfi = getattr(img, 'sfi_tensor', None)
     if sfi is None:
@@ -265,7 +315,9 @@ def resize_preserving_float_gpu_linear(
         raise ValueError(f"sfi_tensor must be HWC 3D, got shape {tuple(sfi.shape)}")
 
     src_h, src_w, channels = sfi.shape
-    if src_w == dest_w and src_h == dest_h:
+    needs_resize = (src_w != dest_w or src_h != dest_h)
+    needs_colorfit = bool(colorfit_model) and colorfit_model != "None"
+    if not needs_resize and not needs_colorfit:
         return img
 
     # If sfi_tensor is already on a usable accelerator (e.g. came from an
@@ -276,36 +328,70 @@ def resize_preserving_float_gpu_linear(
     else:
         src = sfi.detach().to(dtype=torch.float32)
 
-    # Time just the GPU resample. Sync before t0 so in-flight work from the
+    # Time just the GPU work. Sync before t0 so in-flight work from the
     # preceding upscale isn't charged to us, and before t1 so the elapsed time
     # reflects completed kernels rather than async launches. Excludes the final
-    # CPU pull below (that's transfer, not resampling).
+    # CPU pull below (that's transfer, not GPU compute).
     on_cuda = src.device.type == 'cuda'
     if on_cuda:
         torch.cuda.synchronize(src.device)
     t0 = time.perf_counter()
-    print(f"[resize] GPU EWA Lanczos3 {src_w}x{src_h} -> {dest_w}x{dest_h} ({src.device}) start", flush=True)
+    op_tag = "EWA Lanczos3"
+    if needs_colorfit:
+        op_tag += "+ColorFit" if needs_resize else "ColorFit"
+    if needs_resize:
+        print(f"[resize] GPU {op_tag} {src_w}x{src_h} -> {dest_w}x{dest_h} ({src.device}) start", flush=True)
+    else:
+        print(f"[resize] GPU {op_tag} {src_w}x{src_h} ({src.device}) start", flush=True)
 
     bchw = src.permute(2, 0, 1).unsqueeze(0).contiguous()
 
-    rgb_lin = _srgb_to_linear(bchw[:, :3])
-    if channels == 4:
-        rgb_lin = torch.cat([rgb_lin, bchw[:, 3:4]], dim=1)
+    # EWA Lanczos resize (in linear RGB). Skipped if the dims already match —
+    # colorfit doesn't need a linearize round-trip since it lives in sRGB.
+    if needs_resize:
+        rgb_lin = _srgb_to_linear(bchw[:, :3])
+        if channels == 4:
+            rgb_lin = torch.cat([rgb_lin, bchw[:, 3:4]], dim=1)
+        rescaled_lin = _resize_2d_ewa_lanczos3_linear(rgb_lin, dest_h, dest_w)
+        rgb_out = _linear_to_srgb(rescaled_lin[:, :3])
+        alpha_after_resize = rescaled_lin[:, 3:4] if channels == 4 else None
+    else:
+        rgb_out = bchw[:, :3]
+        alpha_after_resize = bchw[:, 3:4] if channels == 4 else None
 
-    rescaled_lin = _resize_2d_ewa_lanczos3_linear(rgb_lin, dest_h, dest_w)
+    # ColorFit per-pixel sRGB correction on the resized float. Operating
+    # AFTER the EWA Lanczos pass means we apply at the calibration resolution
+    # (matches how the fit was sampled) and on a much smaller tensor than the
+    # upscaled intermediate — 7x fewer pixels for a 4x model running at 1.5x
+    # target, with no peak-VRAM blowup at the upscaled resolution.
+    if needs_colorfit:
+        from modules.colorfit import get_colorfit_model
+        cf_model = get_colorfit_model(colorfit_model)
+        if cf_model is not None:
+            rgb_out = cf_model.apply_bchw(rgb_out)
 
-    rgb_out = _linear_to_srgb(rescaled_lin[:, :3])
     if channels == 4:
-        rgb_out = torch.cat([rgb_out, rescaled_lin[:, 3:4]], dim=1)
+        rgb_out = torch.cat([rgb_out, alpha_after_resize], dim=1)
 
     new_sfi = rgb_out.squeeze(0).permute(1, 2, 0).contiguous().detach()
 
     if on_cuda:
         torch.cuda.synchronize(src.device)
-    print(f"[resize] GPU EWA Lanczos3 {src_w}x{src_h} -> {dest_w}x{dest_h} done in {(time.perf_counter() - t0) * 1000.0:.0f}ms", flush=True)
+    if needs_resize:
+        print(f"[resize] GPU {op_tag} {src_w}x{src_h} -> {dest_w}x{dest_h} done in {(time.perf_counter() - t0) * 1000.0:.0f}ms", flush=True)
+    else:
+        print(f"[resize] GPU {op_tag} {src_w}x{src_h} done in {(time.perf_counter() - t0) * 1000.0:.0f}ms", flush=True)
 
-    arr_u8 = (new_sfi.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
     mode = "RGB" if channels == 3 else "RGBA"
+    out_w = dest_w if needs_resize else src_w
+    out_h = dest_h if needs_resize else src_h
+    if _should_skip_post_upscale_u8():
+        # Skip the float→u8 PIL regen entirely — caller has committed to
+        # saving the float sfi_tensor as safetensors and won't touch PIL
+        # pixel data. Eliminates the float CPU pull at this step entirely
+        # (upscaler.upscale handles the single CPU pull for sfi_tensor).
+        return _make_sfi_only_pil(mode, (out_w, out_h), new_sfi)
+    arr_u8 = (new_sfi.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
     new_pil = Image.fromarray(arr_u8, mode)
     new_pil.sfi_tensor = new_sfi
     return new_pil

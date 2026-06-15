@@ -53,7 +53,8 @@ class Upscaler:
     def do_upscale(self, img: PIL.Image, selected_model: str):
         return img
 
-    def upscale(self, img: PIL.Image, scale, selected_model: str = None):
+    def upscale(self, img: PIL.Image, scale, selected_model: str = None,
+                colorfit_model: str = None):
         self.scale = scale
         dest_w = int((img.width * scale) // 8 * 8)
         dest_h = int((img.height * scale) // 8 * 8)
@@ -107,9 +108,21 @@ class Upscaler:
             if shape == (img.width, img.height):
                 break
 
-        if img.width != dest_w or img.height != dest_h:
+        # Resize and per-pixel ColorFit are fused into the same GPU pass in
+        # resize_preserving_float_gpu_linear: sRGB→linear → EWA Lanczos →
+        # linear→sRGB → ColorFit → u8 regen. Single CPU pull at the end,
+        # ColorFit operates on the post-resize tensor (matches the
+        # calibration resolution, ~7x fewer pixels than the upscaled
+        # intermediate). The resize call also handles the no-op case where
+        # dimensions already match but ColorFit is requested.
+        needs_resize = (img.width != dest_w or img.height != dest_h)
+        needs_colorfit = bool(colorfit_model) and colorfit_model != "None"
+        if needs_resize or needs_colorfit:
             from modules.upscaler_utils import resize_preserving_float_gpu_linear
-            img = resize_preserving_float_gpu_linear(img, int(dest_w), int(dest_h))
+            img = resize_preserving_float_gpu_linear(
+                img, int(dest_w), int(dest_h),
+                colorfit_model=colorfit_model if needs_colorfit else None,
+            )
 
         # The upscale chain may have left sfi_tensor on the model device so the
         # whole loop stays GPU-resident; pull it back to CPU once here so

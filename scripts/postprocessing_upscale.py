@@ -82,7 +82,7 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
             "upscaler_2_visibility": extras_upscaler_2_visibility,
         }
 
-    def upscale(self, image, info, upscaler, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop):
+    def upscale(self, image, info, upscaler, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop, colorfit_model_name=None):
         if upscale_mode == 1:
             upscale_by = max(upscale_to_width/image.width, upscale_to_height/image.height)
             info["Postprocess upscale to"] = f"{upscale_to_width}x{upscale_to_height}"
@@ -95,7 +95,10 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
                 upscale_by = max(upscale_to_width/image.width, upscale_to_height/image.height)
                 info["Max side length"] = max_side_length
 
-        image = upscaler.scaler.upscale(image, upscale_by, upscaler.data_path)
+        image = upscaler.scaler.upscale(image, upscale_by, upscaler.data_path,
+                                        colorfit_model=colorfit_model_name)
+        if colorfit_model_name and colorfit_model_name != "None":
+            info["Postprocess colorfit"] = colorfit_model_name
 
         if upscale_mode == 1 and upscale_crop:
             cropped = Image.new("RGB", (upscale_to_width, upscale_to_height))
@@ -105,7 +108,7 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
 
         return image
 
-    def process_firstpass(self, pp: scripts_postprocessing.PostprocessedImage, upscale_enabled=True, upscale_mode=1, upscale_by=2.0, max_side_length=0, upscale_to_width=None, upscale_to_height=None, upscale_crop=False, upscaler_1_name=None, upscaler_2_name=None, upscaler_2_visibility=0.0):
+    def process_firstpass(self, pp: scripts_postprocessing.PostprocessedImage, upscale_enabled=True, upscale_mode=1, upscale_by=2.0, max_side_length=0, upscale_to_width=None, upscale_to_height=None, upscale_crop=False, upscaler_1_name=None, upscaler_2_name=None, upscaler_2_visibility=0.0, colorfit_model_name=None):
         if upscale_mode == 1:
             pp.shared.target_width = upscale_to_width
             pp.shared.target_height = upscale_to_height
@@ -115,7 +118,7 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
 
             pp.shared.target_width, pp.shared.target_height = limit_size_by_one_dimention(pp.shared.target_width, pp.shared.target_height, max_side_length)
 
-    def process(self, pp: scripts_postprocessing.PostprocessedImage, upscale_enabled=True, upscale_mode=1, upscale_by=2.0, max_side_length=0, upscale_to_width=None, upscale_to_height=None, upscale_crop=False, upscaler_1_name=None, upscaler_2_name=None, upscaler_2_visibility=0.0):
+    def process(self, pp: scripts_postprocessing.PostprocessedImage, upscale_enabled=True, upscale_mode=1, upscale_by=2.0, max_side_length=0, upscale_to_width=None, upscale_to_height=None, upscale_crop=False, upscaler_1_name=None, upscaler_2_name=None, upscaler_2_visibility=0.0, colorfit_model_name=None):
         if not upscale_enabled:
             return
 
@@ -136,11 +139,11 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
         upscaler2 = next(iter([x for x in shared.sd_upscalers if x.name == upscaler_2_name and x.name != "None"]), None)
         assert upscaler2 or (upscaler_2_name is None), f'could not find upscaler named {upscaler_2_name}'
 
-        upscaled_image = self.upscale(pp.image, pp.info, upscaler1, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop)
+        upscaled_image = self.upscale(pp.image, pp.info, upscaler1, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop, colorfit_model_name=colorfit_model_name)
         pp.info["Postprocess upscaler"] = upscaler1.name
 
         if upscaler2 and upscaler_2_visibility > 0:
-            second_upscale = self.upscale(pp.image, pp.info, upscaler2, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop)
+            second_upscale = self.upscale(pp.image, pp.info, upscaler2, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop, colorfit_model_name=colorfit_model_name)
             if upscaled_image.mode != second_upscale.mode:
                 second_upscale = second_upscale.convert(upscaled_image.mode)
             upscaled_image = Image.blend(upscaled_image, second_upscale, upscaler_2_visibility)

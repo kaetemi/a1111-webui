@@ -203,6 +203,7 @@ class ExtrasBaseRequest(BaseModel):
     upscaler_2: str = Field(default="None", title="Secondary upscaler", description=f"The name of the secondary upscaler to use, it has to be one of this list: {' , '.join([x.name for x in sd_upscalers])}")
     extras_upscaler_2_visibility: float = Field(default=0, title="Secondary upscaler visibility", ge=0, le=1, allow_inf_nan=False, description="Sets the visibility of secondary upscaler, values should be between 0 and 1.")
     upscale_first: bool = Field(default=False, title="Upscale first", description="Should the upscaler run before restoring faces?")
+    colorfit_model: str = Field(default="None", title="ColorFit model", description="Optional ColorFit model basename (looked up under <models>/ColorFit/<name>.safetensors). Applied per-pixel on GPU to the upscaled float sRGB output before the post-upscale resize. \"None\" or empty disables.")
     send_images: bool = Field(default=True, title="Send images", description="Should the backend return the generated image in base64 format?")
     save_tmp_images: bool = Field(default=False, title="Save Temp Image", description="Save output to tmp folder with random name")
     save_tmp_extension: str = Field(default="png", title="Temp Image Extension", description="File extension for temp images (e.g. png, jpg, tga)")

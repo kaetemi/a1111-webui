@@ -133,7 +133,7 @@ def run_postprocessing_webui(id_task, *args, **kwargs):
     return run_postprocessing(*args, **kwargs)
 
 
-def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_dir, show_extras_results, gfpgan_visibility, codeformer_visibility, codeformer_weight, upscaling_resize, upscaling_resize_w, upscaling_resize_h, upscaling_crop, extras_upscaler_1, extras_upscaler_2, extras_upscaler_2_visibility, upscale_first: bool, save_output: bool = True, max_side_length: int = 0):
+def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_dir, show_extras_results, gfpgan_visibility, codeformer_visibility, codeformer_weight, upscaling_resize, upscaling_resize_w, upscaling_resize_h, upscaling_crop, extras_upscaler_1, extras_upscaler_2, extras_upscaler_2_visibility, upscale_first: bool, save_output: bool = True, max_side_length: int = 0, colorfit_model: str = "None"):
     """old handler for API"""
 
     args = scripts.scripts_postproc.create_args_for_run({
@@ -148,6 +148,7 @@ def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_
             "upscaler_1_name": extras_upscaler_1,
             "upscaler_2_name": extras_upscaler_2,
             "upscaler_2_visibility": extras_upscaler_2_visibility,
+            "colorfit_model_name": colorfit_model,
         },
         "GFPGAN": {
             "enable": True,
