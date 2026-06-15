@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from typing import Optional
 
@@ -35,6 +36,35 @@ from PIL import Image
 from safetensors import safe_open
 
 from modules import devices, shared
+
+
+# Per-thread record of the most recently applied colorfit model. The extras
+# API handler resets this before run_extras and reads it after — gives the
+# caller (the bot) a positive confirmation that the chain actually ran the
+# colorfit rather than silently dropping the request at some layer. The
+# value is the basename (no `.safetensors`) so it matches what the request
+# asked for. Thread-local because A1111 queue_locks the work but the field
+# could outlive a request if a different thread handled it.
+_apply_tracker = threading.local()
+
+
+def _record_applied(basename: str) -> None:
+    """Mark that a colorfit model ran on this thread. Called from
+    ColorFitModel.apply_bchw — the closest point to the actual GPU work."""
+    _apply_tracker.value = basename
+
+
+def reset_applied_tracker() -> None:
+    """Clear any prior apply record on this thread. Called by the API
+    handler before run_extras so the response reflects only this request."""
+    _apply_tracker.value = None
+
+
+def get_applied() -> Optional[str]:
+    """Read the most recently applied colorfit model name (basename) on
+    this thread. Returns None if nothing applied. Called by the API
+    handler after run_extras to populate the response."""
+    return getattr(_apply_tracker, "value", None)
 
 
 def colorfit_model_dir() -> str:
@@ -239,10 +269,25 @@ class ColorFitModel:
         h11 =        t3 -       t2
         return h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1
 
+    @property
+    def basename(self) -> str:
+        """Basename without the .safetensors suffix — what callers refer to
+        the model by, and what the worker reports back to the bot."""
+        return os.path.splitext(os.path.basename(self.path))[0]
+
     def apply_bchw(self, rgb_bchw: torch.Tensor) -> torch.Tensor:
         """Apply transform to a (B, 3, H, W) sRGB float tensor on its current
-        device. Returns same shape/dtype/device. Alpha (if present) should be
-        handled by the caller — this method only takes 3-channel RGB."""
+        device. Returns same shape/dtype/device, clamped to [0, 1]. Alpha
+        (if present) should be handled by the caller — this method only
+        takes 3-channel RGB.
+
+        The output clamp guards against cubic Hermite extrapolation off the
+        end segments amplifying tiny input overshoot (the EWA Lanczos pass
+        upstream can produce values slightly outside [0, 1] from kernel
+        lobes), and against free-endpoint variants (v2/v4 with
+        free-output-endpoints) producing values outside [0, 1] structurally.
+        Training data was sRGB in [0, 1]; anything outside is undefined per
+        the calibration."""
         if rgb_bchw.dim() != 4 or rgb_bchw.shape[1] != 3:
             raise ValueError(
                 f"colorfit expected (B, 3, H, W); got {tuple(rgb_bchw.shape)}"
@@ -254,7 +299,9 @@ class ColorFitModel:
             M = self.matrices[i].to(dtype=x.dtype)
             x = x @ M.T
             x = self._apply_curve(x, self.knot_ys[i + 1], self.slopes[i + 1])
-        return x.reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
+        out = x.reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous().clamp_(0.0, 1.0)
+        _record_applied(self.basename)
+        return out
 
 
 # ── Cache + resolution ───────────────────────────────────────────────────────

@@ -887,13 +887,16 @@ class Api:
         # adds up across long upscale chains and large outputs.
         skip_u8 = (not send_images) and (str(save_tmp_extension).lower() == 'safetensors')
         from modules.upscaler_utils import set_post_upscale_skip_u8
+        from modules.colorfit import reset_applied_tracker, get_applied
 
         try:
             set_post_upscale_skip_u8(skip_u8)
+            reset_applied_tracker()
             with self.queue_lock:
                 result = postprocessing.run_extras(extras_mode=0, image_folder="", input_dir="", output_dir="", save_output=False, **reqDict)
         finally:
             set_post_upscale_skip_u8(False)
+        colorfit_applied = get_applied()
 
         # Save to tmp if requested
         tmp_image_path = None
@@ -903,7 +906,7 @@ class Api:
 
         b64image = encode_pil_to_base64(result[0][0]) if send_images else None
 
-        return models.ExtrasSingleImageResponse(image=b64image, tmp_image=tmp_image_path, html_info=result[1])
+        return models.ExtrasSingleImageResponse(image=b64image, tmp_image=tmp_image_path, html_info=result[1], colorfit_applied=colorfit_applied)
 
     def extras_batch_images_api(self, req: models.ExtrasBatchImagesRequest):
         reqDict = setUpscalers(req)
@@ -919,13 +922,16 @@ class Api:
         # See extras_single_image_api — same skip condition.
         skip_u8 = (not send_images) and (str(save_tmp_extension).lower() == 'safetensors')
         from modules.upscaler_utils import set_post_upscale_skip_u8
+        from modules.colorfit import reset_applied_tracker, get_applied
 
         try:
             set_post_upscale_skip_u8(skip_u8)
+            reset_applied_tracker()
             with self.queue_lock:
                 result = postprocessing.run_extras(extras_mode=1, image_folder=image_folder, image="", input_dir="", output_dir="", save_output=False, **reqDict)
         finally:
             set_post_upscale_skip_u8(False)
+        colorfit_applied = get_applied()
 
         # Save to tmp if requested
         tmp_image_paths = None
@@ -934,7 +940,7 @@ class Api:
 
         b64images = list(map(encode_pil_to_base64, result[0])) if send_images else []
 
-        return models.ExtrasBatchImagesResponse(images=b64images, tmp_images=tmp_image_paths, html_info=result[1])
+        return models.ExtrasBatchImagesResponse(images=b64images, tmp_images=tmp_image_paths, html_info=result[1], colorfit_applied=colorfit_applied)
 
     def pnginfoapi(self, req: models.PNGInfoRequest):
         image = decode_base64_to_image(req.image.strip())

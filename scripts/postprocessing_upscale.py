@@ -69,6 +69,14 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
 
         extras_upscaler_1.change(on_selected_upscale_method, inputs=[extras_upscaler_1], outputs=[upscaling_resize], show_progress="hidden")
 
+        # API-only knob — no UI surface, but the key must appear in the
+        # `ui()` return dict so create_args_for_run picks it up from
+        # scripts_args ({"Upscale": {"colorfit_model_name": ...}}). Without
+        # this hidden gr.Textbox the framework's args_from/args_to slot
+        # indexing silently drops the value before it reaches process().
+        colorfit_model_name = gr.Textbox(value="None", visible=False,
+                                        elem_id=self.elem_id_suffix("extras_colorfit_model"))
+
         return {
             "upscale_enabled": upscale_enabled,
             "upscale_mode": selected_tab,
@@ -80,6 +88,7 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
             "upscaler_1_name": extras_upscaler_1,
             "upscaler_2_name": extras_upscaler_2,
             "upscaler_2_visibility": extras_upscaler_2_visibility,
+            "colorfit_model_name": colorfit_model_name,
         }
 
     def upscale(self, image, info, upscaler, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop, colorfit_model_name=None):

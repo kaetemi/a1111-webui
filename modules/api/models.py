@@ -217,6 +217,7 @@ class ExtrasSingleImageRequest(ExtrasBaseRequest):
 class ExtrasSingleImageResponse(ExtraBaseResponse):
     image: str = Field(default=None, title="Image", description="The generated image in base64 format.")
     tmp_image: Optional[str] = Field(default=None, title="Temp Image Path", description="Path to saved temporary image.")
+    colorfit_applied: Optional[str] = Field(default=None, title="ColorFit applied", description="Basename of the ColorFit model that was actually applied per-pixel inside the post-upscale resize, or null if none. Lets callers verify that a requested colorfit_model wasn't silently dropped at some plumbing layer.")
 
 class FileData(BaseModel):
     data: str = Field(title="File data", description="Base64 representation of the file")
@@ -228,6 +229,7 @@ class ExtrasBatchImagesRequest(ExtrasBaseRequest):
 class ExtrasBatchImagesResponse(ExtraBaseResponse):
     images: list[str] = Field(title="Images", description="The generated images in base64 format.")
     tmp_images: Optional[list[str]] = Field(default=None, title="Temp Image Paths", description="Paths to saved temporary images.")
+    colorfit_applied: Optional[str] = Field(default=None, title="ColorFit applied", description="Basename of the ColorFit model that was actually applied (same model across the whole batch). Lets callers verify a requested colorfit_model wasn't silently dropped at some plumbing layer.")
 
 class PNGInfoRequest(BaseModel):
     image: str = Field(title="Image", description="The base64 encoded PNG image")
