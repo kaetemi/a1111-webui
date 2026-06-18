@@ -92,9 +92,19 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
         }
 
     def upscale(self, image, info, upscaler, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop, colorfit_model_name=None):
+        dest_size = None
         if upscale_mode == 1:
             upscale_by = max(upscale_to_width/image.width, upscale_to_height/image.height)
             info["Postprocess upscale to"] = f"{upscale_to_width}x{upscale_to_height}"
+        elif upscale_mode == 2:
+            # Stretch: model-upscale with the cover scale (so the final resize
+            # is a downscale on both axes -- where EWA Lanczos is at its best),
+            # then resize to the exact requested dimensions. When the target
+            # aspect differs from the source this is a non-uniform stretch; no
+            # crop or pad. dest_size forces the exact output resolution.
+            upscale_by = max(upscale_to_width/image.width, upscale_to_height/image.height)
+            dest_size = (upscale_to_width, upscale_to_height)
+            info["Postprocess stretch to"] = f"{upscale_to_width}x{upscale_to_height}"
         else:
             info["Postprocess upscale by"] = upscale_by
             if max_side_length != 0 and max(*image.size)*upscale_by > max_side_length:
@@ -105,7 +115,7 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
                 info["Max side length"] = max_side_length
 
         image = upscaler.scaler.upscale(image, upscale_by, upscaler.data_path,
-                                        colorfit_model=colorfit_model_name)
+                                        colorfit_model=colorfit_model_name, dest_size=dest_size)
         if colorfit_model_name and colorfit_model_name != "None":
             info["Postprocess colorfit"] = colorfit_model_name
 
@@ -118,7 +128,7 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
         return image
 
     def process_firstpass(self, pp: scripts_postprocessing.PostprocessedImage, upscale_enabled=True, upscale_mode=1, upscale_by=2.0, max_side_length=0, upscale_to_width=None, upscale_to_height=None, upscale_crop=False, upscaler_1_name=None, upscaler_2_name=None, upscaler_2_visibility=0.0, colorfit_model_name=None):
-        if upscale_mode == 1:
+        if upscale_mode in (1, 2):
             pp.shared.target_width = upscale_to_width
             pp.shared.target_height = upscale_to_height
         else:

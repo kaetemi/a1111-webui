@@ -54,10 +54,21 @@ class Upscaler:
         return img
 
     def upscale(self, img: PIL.Image, scale, selected_model: str = None,
-                colorfit_model: str = None):
+                colorfit_model: str = None, dest_size: tuple = None):
         self.scale = scale
-        dest_w = int((img.width * scale) // 8 * 8)
-        dest_h = int((img.height * scale) // 8 * 8)
+        if dest_size is not None:
+            # Caller demands an exact final resolution (e.g. the API's
+            # stretch mode hitting an off-ratio external target). Honour it
+            # verbatim -- no 8-px alignment rounding -- and let the final
+            # EWA Lanczos resize map the aspect-preserved model output onto
+            # these independent dimensions (a non-uniform stretch when the
+            # target aspect differs from the source). `scale` still drives
+            # the native-factor model loop and the memory gate below.
+            dest_w = int(dest_size[0])
+            dest_h = int(dest_size[1])
+        else:
+            dest_w = int((img.width * scale) // 8 * 8)
+            dest_h = int((img.height * scale) // 8 * 8)
 
         # A large upscale allocates several full-size float buffers on the GPU
         # (the model's output, combine/linear copies). If the Stable Diffusion
