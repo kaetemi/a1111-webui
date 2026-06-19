@@ -120,9 +120,18 @@ def _fritsch_carlson_slopes(knot_y: torch.Tensor, K: int) -> torch.Tensor:
     return torch.minimum(m.clamp(min=0.0), m_max)
 
 
-def _normalize_matrix(m_raw: torch.Tensor) -> torch.Tensor:
-    rs = m_raw.sum(dim=1, keepdim=True).clamp(min=1e-3)
-    return m_raw / rs
+def _normalize_matrix(m_raw: torch.Tensor, gauge: str = "l1") -> torch.Tensor:
+    """Per-row normalization. `gauge='l1'` (default) divides each row by its
+    sum (row-stochastic — rows sum to 1, preserves the (1,1,1) eigenvector).
+    `gauge='l2'` divides each row by its Euclidean norm (unit-norm rows,
+    which combined with row orthogonality give proper rotations; inverse
+    is the transpose). Both clamp to 1e-3 defensively against near-zero
+    denominators."""
+    if gauge == "l2":
+        denom = m_raw.norm(dim=1, keepdim=True).clamp(min=1e-3)
+    else:
+        denom = m_raw.sum(dim=1, keepdim=True).clamp(min=1e-3)
+    return m_raw / denom
 
 
 # ── Loaded model ─────────────────────────────────────────────────────────────
@@ -144,6 +153,7 @@ class ColorFitModel:
         "structured_sandwich_v2",
         "structured_sandwich_v3",
         "structured_sandwich_v4",
+        "structured_sandwich_v5",
     }
 
     def __init__(self, path: str, device: Optional[torch.device] = None):
@@ -171,17 +181,16 @@ class ColorFitModel:
             self.config = cfg
 
             # Stage-count axis. v1/v2/v3 are pinned at n_matrices=2 in the
-            # spec; v4 puts it in metadata (default to 2 if missing for
-            # legacy v4 files).
-            if model_id == "structured_sandwich_v4":
+            # spec; v4 and v5 put it in metadata (default to 2 if missing).
+            if model_id in ("structured_sandwich_v4", "structured_sandwich_v5"):
                 self.n_matrices = int(cfg.get("n_matrices", 2))
             else:
                 self.n_matrices = 2
 
-            # Interpolation. v3 is cubic; v4 reads from metadata; v1/v2 linear.
+            # Interpolation. v3 is cubic; v4/v5 read from metadata; v1/v2 linear.
             if model_id == "structured_sandwich_v3":
                 self.interpolation = "cubic"
-            elif model_id == "structured_sandwich_v4":
+            elif model_id in ("structured_sandwich_v4", "structured_sandwich_v5"):
                 self.interpolation = cfg.get("interpolation", "linear")
                 if self.interpolation not in ("linear", "cubic"):
                     raise ValueError(
@@ -191,6 +200,10 @@ class ColorFitModel:
                 self.interpolation = "linear"
 
             tensors = {k: f.get_tensor(k) for k in f.keys()}
+
+        if model_id == "structured_sandwich_v5":
+            self._init_v5(path, device, tensors)
+            return
 
         n_curves = self.n_matrices + 1
         last_name = f"f{n_curves}"
@@ -336,14 +349,163 @@ class ColorFitModel:
         # The clamp here is mandatory, not optional — see FIT_FORMAT.md
         # "Input clamp" for the full rationale and observed numbers.
         x = x.nan_to_num(nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        x = self._apply_curve(x, self.knot_ys[0], self.slopes[0])
-        for i in range(self.n_matrices):
-            M = self.matrices[i].to(dtype=x.dtype)
-            x = x @ M.T
-            x = self._apply_curve(x, self.knot_ys[i + 1], self.slopes[i + 1])
+        if self.model_id == "structured_sandwich_v5":
+            x = self._apply_chain_v5(x)
+        else:
+            x = self._apply_curve(x, self.knot_ys[0], self.slopes[0])
+            for i in range(self.n_matrices):
+                M = self.matrices[i].to(dtype=x.dtype)
+                x = x @ M.T
+                x = self._apply_curve(x, self.knot_ys[i + 1], self.slopes[i + 1])
         out = x.reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous().clamp_(0.0, 1.0)
         _record_applied(self.basename)
         return out
+
+    # ── v5: dynamic per-channel symmetric domains ─────────────────────────────
+    #
+    # v5 curves operate on [-S_c, +S_c] per channel. S is propagated forward
+    # from the matrices (S_next[r] = sum_c |M[r,c]| * S_prev[c]). Curves are
+    # parameterized internally in normalized [0, 1] space, then rescaled per
+    # channel at apply time using the channel's S.
+
+    def _init_v5(self, path: str, device: torch.device,
+                 tensors: dict) -> None:
+        n_matrices = self.n_matrices
+        n_curves = n_matrices + 1
+        last_name = f"f{n_curves}"
+        # Gauge: l1 (row-stochastic) or l2 (unit-norm rows). Default l1 so
+        # any v5 fit from before the gauge field existed still loads with
+        # the original row-stochastic normalization.
+        self.gauge = self.config.get("gauge", "l1")
+        if self.gauge not in ("l1", "l2"):
+            raise ValueError(
+                f"{path}: unknown gauge '{self.gauge}' (expected 'l1' or 'l2')"
+            )
+
+        # K from f1.theta (no knot_x in v5).
+        theta1 = tensors["f1.theta"]
+        if theta1.dim() != 2 or theta1.shape[0] != 3:
+            raise ValueError(f"{path}: f1.theta must be (3, K)")
+        K = int(theta1.shape[1])
+        for i in range(2, n_curves + 1):
+            ti = tensors.get(f"f{i}.theta")
+            if ti is None:
+                raise ValueError(
+                    f"{path}: structured_sandwich_v5 missing f{i}.theta"
+                )
+            if ti.shape != theta1.shape:
+                raise ValueError(f"{path}: f{i}.theta shape mismatch")
+        self.K = K
+
+        # Normalized matrices (entries may be any sign). Gauge picks the
+        # per-row normalization.
+        self.matrices: list[torch.Tensor] = []
+        for i in range(1, n_matrices + 1):
+            m_raw = tensors[f"M{i}.M_raw"].to(device, dtype=torch.float32)
+            self.matrices.append(_normalize_matrix(m_raw, gauge=self.gauge))
+
+        # Forward S propagation. S_per_curve[i] is the bound for curve f_{i+1}
+        # (i.e. S_per_curve[0] = f1 bound = (1, 1, 1); S_per_curve[1] = f2
+        # bound = |M1| @ (1, 1, 1); etc.).
+        S = torch.ones(3, device=device, dtype=torch.float32)
+        self.S_per_curve: list[torch.Tensor] = [S]
+        for M in self.matrices:
+            S = M.abs() @ S
+            self.S_per_curve.append(S)
+
+        # Last curve free-endpoint extras (optional per tensor presence).
+        free_present = (f"{last_name}.start_theta" in tensors
+                        and f"{last_name}.total_theta" in tensors)
+        self.has_free_last = free_present
+        if free_present:
+            self.last_start = tensors[f"{last_name}.start_theta"].to(
+                device, dtype=torch.float32)
+            self.last_total = F.softplus(
+                tensors[f"{last_name}.total_theta"].to(device, dtype=torch.float32))
+        else:
+            self.last_start = None
+            self.last_total = None
+
+        # Per-curve normalized knot heights and (cubic) slopes. Heights are
+        # ratios in [0, 1] regardless of S; the rescaling happens at apply.
+        self.knot_ys_norm: list[torch.Tensor] = []
+        self.slopes_norm: list[Optional[torch.Tensor]] = []
+        for i in range(1, n_curves + 1):
+            theta = tensors[f"f{i}.theta"].to(device, dtype=torch.float32)
+            # start=None, total=None → returns ratios in [0, 1] anchored at 0/1.
+            y_norm = _build_knot_y(theta, start=None, total=None)
+            self.knot_ys_norm.append(y_norm)
+            self.slopes_norm.append(
+                _fritsch_carlson_slopes(y_norm, K)
+                if self.interpolation == "cubic" else None)
+
+        # Sanity-check the computed buffers.
+        def _finite(t, name):
+            if not torch.isfinite(t).all():
+                raise ValueError(
+                    f"ColorFit model {path}: {name} contains NaN or inf "
+                    f"after reconstruction."
+                )
+        for i, ky in enumerate(self.knot_ys_norm, start=1):
+            _finite(ky, f"f{i} knot_y_norm")
+        for i, sl in enumerate(self.slopes_norm, start=1):
+            if sl is not None:
+                _finite(sl, f"f{i} slopes_norm")
+        for i, m in enumerate(self.matrices, start=1):
+            _finite(m, f"M{i} normalized")
+
+    def _apply_curve_v5(self, x: torch.Tensor, S: torch.Tensor,
+                        knot_y_norm: torch.Tensor,
+                        slopes_norm: Optional[torch.Tensor],
+                        is_last: bool) -> torch.Tensor:
+        """v5 per-channel curve eval: x ∈ [-S_c, +S_c] → normalize to [0, 1],
+        cubic/linear interpolate in normalized space, rescale to output.
+        x: (N, 3). S: (3,). knot_y_norm: (3, K+1) ratios in [0, 1].
+        """
+        K = self.K
+        dtype = x.dtype
+        ky = knot_y_norm.to(dtype=dtype)
+        S_row = S.to(dtype=dtype).unsqueeze(0)        # (1, 3)
+        # Normalize input to [0, 1] for interior evaluation.
+        u = (x + S_row) / (2.0 * S_row)               # (N, 3)
+        seg_f = u * K
+        seg = seg_f.floor().clamp(0, K - 1).long()
+        t = seg_f - seg.to(dtype=dtype)
+        c_idx = torch.arange(3, device=x.device).expand_as(seg)
+        y0 = ky[c_idx, seg]
+        y1 = ky[c_idx, seg + 1]
+        if slopes_norm is None:
+            y_norm = y0 + t * (y1 - y0)
+        else:
+            sl = slopes_norm.to(dtype=dtype)
+            m0 = sl[c_idx, seg]     / K
+            m1 = sl[c_idx, seg + 1] / K
+            t2 = t * t
+            t3 = t2 * t
+            h00 =  2.0 * t3 - 3.0 * t2 + 1.0
+            h10 =        t3 - 2.0 * t2 + t
+            h01 = -2.0 * t3 + 3.0 * t2
+            h11 =        t3 -       t2
+            y_norm = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1
+        # Rescale to actual coords.
+        if is_last and self.has_free_last:
+            start = self.last_start.to(dtype=dtype).unsqueeze(0)  # (1, 3)
+            total = self.last_total.to(dtype=dtype).unsqueeze(0)  # (1, 3)
+            return start + y_norm * total
+        return (2.0 * y_norm - 1.0) * S_row
+
+    def _apply_chain_v5(self, x: torch.Tensor) -> torch.Tensor:
+        n = self.n_matrices
+        x = self._apply_curve_v5(x, self.S_per_curve[0], self.knot_ys_norm[0],
+                                 self.slopes_norm[0], is_last=(n == 0))
+        for i in range(n):
+            M = self.matrices[i].to(dtype=x.dtype)
+            x = x @ M.T
+            is_last = (i == n - 1)
+            x = self._apply_curve_v5(x, self.S_per_curve[i + 1],
+                                     self.knot_ys_norm[i + 1],
+                                     self.slopes_norm[i + 1], is_last=is_last)
+        return x
 
 
 # ── Cache + resolution ───────────────────────────────────────────────────────
