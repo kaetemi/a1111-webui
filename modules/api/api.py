@@ -213,6 +213,27 @@ def save_tmp_images(image_list, extension="png"):
     return tmp_paths
 
 
+def _sfi_output_incompatibilities(reqDict: dict) -> list[str]:
+    """Reasons a request can't produce a valid safetensors (SFI) file, or [].
+
+    SFI writes the unmodified float `sfi_tensor`; any of these post-upscale
+    operations replaces or drops it, so the save is doomed regardless of the
+    u8-skip optimization. The extras endpoints check this up front and return
+    a 400 rather than letting the run start and fail later in _save_sfi_image
+    -- or, for the second-upscaler case, silently average two independently
+    color-corrected branches before the save fails."""
+    reasons = []
+    if str(reqDict.get('extras_upscaler_2', 'None')) != 'None' \
+            and float(reqDict.get('extras_upscaler_2_visibility', 0) or 0) > 0:
+        reasons.append("a second upscaler (its sRGB-space blend drops the float tensor)")
+    if float(reqDict.get('gfpgan_visibility', 0) or 0) > 0 \
+            or float(reqDict.get('codeformer_visibility', 0) or 0) > 0:
+        reasons.append("face restoration (it replaces the float output with uint8)")
+    if int(reqDict.get('resize_mode', 0)) == 1 and reqDict.get('upscaling_crop'):
+        reasons.append("resize mode 1 with crop (the center-crop drops the float tensor)")
+    return reasons
+
+
 # Latents are exchanged as safetensors blobs carrying an internal filetype marker in
 # the file metadata, so a load can reject anything that isn't one of ours.
 LATENT_FILETYPE = "sd-webui-latent"
@@ -879,6 +900,18 @@ class Api:
         save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
         save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
 
+        # SFI (safetensors) output requires the float tensor to survive to the
+        # save; reject doomed combinations at the boundary with a 400 instead
+        # of failing mid-run (or, for second-upscaler + colorfit, silently
+        # averaging two corrected images).
+        if save_tmp_images_flag and str(save_tmp_extension).lower() == 'safetensors':
+            reasons = _sfi_output_incompatibilities(reqDict)
+            if reasons:
+                raise HTTPException(status_code=400, detail=(
+                    "Safetensors output is incompatible with " + "; ".join(reasons)
+                    + ". Drop the incompatible option or use a different format."
+                ))
+
         # Skip the post-upscale float→u8 PIL regen when nothing wants u8:
         # the response won't carry base64 (send_images=False) AND any tmp
         # save will route through the safetensors writer (which reads
@@ -918,6 +951,15 @@ class Api:
         send_images = reqDict.pop('send_images', True)
         save_tmp_images_flag = reqDict.pop('save_tmp_images', False)
         save_tmp_extension = reqDict.pop('save_tmp_extension', 'png')
+
+        # Same SFI-compatibility guard as the single-image path above.
+        if save_tmp_images_flag and str(save_tmp_extension).lower() == 'safetensors':
+            reasons = _sfi_output_incompatibilities(reqDict)
+            if reasons:
+                raise HTTPException(status_code=400, detail=(
+                    "Safetensors output is incompatible with " + "; ".join(reasons)
+                    + ". Drop the incompatible option or use a different format."
+                ))
 
         # See extras_single_image_api — same skip condition.
         skip_u8 = (not send_images) and (str(save_tmp_extension).lower() == 'safetensors')

@@ -18,7 +18,6 @@ reuse the parsed tensors and precomputed knot heights / Hermite slopes.
 API surface:
   colorfit_model_dir()             -> directory path
   list_colorfit_models()           -> list of available basenames
-  apply_colorfit_to_pil(img, name) -> PIL with sfi_tensor patched in place
 """
 
 from __future__ import annotations
@@ -26,13 +25,10 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from safetensors import safe_open
 
 from modules import devices, shared
@@ -539,67 +535,3 @@ def get_colorfit_model(name: Optional[str]) -> Optional[ColorFitModel]:
     model = ColorFitModel(path)
     _CACHE[path] = model
     return model
-
-
-# ── PIL bridge ───────────────────────────────────────────────────────────────
-
-def apply_colorfit_to_pil(img: Image.Image, name: Optional[str]) -> Image.Image:
-    """Apply a colorfit model to a PIL image carrying an `sfi_tensor`.
-
-    The sfi_tensor is the float sRGB output of the upscale chain. We apply
-    the colorfit on GPU and re-attach the corrected tensor; the PIL's u8
-    array is also regenerated so a downstream consumer that ignores
-    sfi_tensor gets the corrected color too.
-
-    When `name` is empty/'None' or no sfi_tensor is attached, this is a no-op
-    (with a warning log for the missing-sfi case).
-    """
-    model = get_colorfit_model(name)
-    if model is None:
-        return img
-    sfi = getattr(img, "sfi_tensor", None)
-    if sfi is None:
-        print(
-            f"[colorfit] no sfi_tensor on input; skipping colorfit '{name}' "
-            f"(can't apply without the float sRGB tensor)",
-            flush=True,
-        )
-        return img
-    if not isinstance(sfi, torch.Tensor):
-        sfi = torch.as_tensor(sfi)
-    if sfi.ndim != 3:
-        raise ValueError(f"sfi_tensor must be HWC 3D, got shape {tuple(sfi.shape)}")
-
-    h, w, channels = sfi.shape
-    device = sfi.device if sfi.device.type != "cpu" else devices.get_optimal_device()
-    src = sfi.detach().to(dtype=torch.float32, device=device)
-
-    on_cuda = device.type == "cuda"
-    if on_cuda:
-        torch.cuda.synchronize(device)
-    t0 = time.perf_counter()
-    print(
-        f"[colorfit] apply {os.path.basename(model.path)} on {w}x{h} "
-        f"({device}) start",
-        flush=True,
-    )
-
-    bchw = src.permute(2, 0, 1).unsqueeze(0).contiguous()
-    rgb_out = model.apply_bchw(bchw[:, :3])
-    if channels == 4:
-        rgb_out = torch.cat([rgb_out, bchw[:, 3:4]], dim=1)
-    new_sfi = rgb_out.squeeze(0).permute(1, 2, 0).contiguous().detach()
-
-    if on_cuda:
-        torch.cuda.synchronize(device)
-    print(
-        f"[colorfit] apply {os.path.basename(model.path)} done in "
-        f"{(time.perf_counter() - t0) * 1000.0:.0f}ms",
-        flush=True,
-    )
-
-    arr_u8 = (new_sfi.clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
-    mode = "RGB" if channels == 3 else "RGBA"
-    new_pil = Image.fromarray(arr_u8, mode)
-    new_pil.sfi_tensor = new_sfi
-    return new_pil

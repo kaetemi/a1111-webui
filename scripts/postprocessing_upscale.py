@@ -158,6 +158,21 @@ class ScriptPostprocessingUpscale(scripts_postprocessing.ScriptPostprocessing):
         upscaler2 = next(iter([x for x in shared.sd_upscalers if x.name == upscaler_2_name and x.name != "None"]), None)
         assert upscaler2 or (upscaler_2_name is None), f'could not find upscaler named {upscaler_2_name}'
 
+        # ColorFit is a single final per-pixel correction meant for the
+        # composited output. A second upscaler blends its two branches in
+        # sRGB uint8 space, which would average two independently
+        # color-corrected images (wrong) and drop the float tensor either
+        # way. Reject rather than silently mis-correct -- the non-safetensors
+        # path has no other guard, so without this the wrong color ships out.
+        colorfit_active = bool(colorfit_model_name) and colorfit_model_name != "None"
+        if colorfit_active and upscaler2 is not None and upscaler_2_visibility > 0:
+            raise ValueError(
+                f"ColorFit ('{colorfit_model_name}') cannot be combined with a second "
+                f"upscaler ('{upscaler_2_name}'): the two branches are blended in sRGB "
+                f"uint8 space, averaging independently color-corrected images. Set "
+                f"extras_upscaler_2='None' (or its visibility to 0) to use ColorFit."
+            )
+
         upscaled_image = self.upscale(pp.image, pp.info, upscaler1, upscale_mode, upscale_by, max_side_length, upscale_to_width, upscale_to_height, upscale_crop, colorfit_model_name=colorfit_model_name)
         pp.info["Postprocess upscaler"] = upscaler1.name
 
